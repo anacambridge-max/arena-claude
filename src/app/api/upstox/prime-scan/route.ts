@@ -31,6 +31,15 @@ export async function GET() {
     const keys = instruments.map((i) => i.instrumentKey);
     const quotes = await upstoxService.getMarketQuotes(keys);
 
+    // Upstox returns market-quote objects keyed by EXCHANGE:SYMBOL, while
+    // each object also carries the requested instrument_token in pipe form.
+    // Build a token index so F&O futures are matched reliably regardless of
+    // the response object's display-key format.
+    const quoteByToken = new Map<string, (typeof quotes)[string]>();
+    for (const quote of Object.values(quotes)) {
+      if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
+    }
+
     const results: ReturnType<typeof runPrimeScan>[] = [];
     let failedCount = fallback.length - instruments.length;
     const now = getCurrentISTTime();
@@ -40,10 +49,8 @@ export async function GET() {
     const toDate = getTodayDateIST();
 
     const scanOne = async (instrument: (typeof instruments)[number]) => {
-      // Upstox market-quote response keys are EXCHANGE:SYMBOL, while
-      // instrument_key values use EXCHANGE|TOKEN. Resolve by token first,
-      // then fall back to the colon form returned by the API.
-      const quote = quotes[instrument.instrumentKey]
+      const quote = quoteByToken.get(instrument.instrumentKey)
+        ?? quotes[instrument.instrumentKey]
         ?? quotes[instrument.instrumentKey.replace('|', ':')];
 
       if (!quote?.last_price) return { ok: false as const };
