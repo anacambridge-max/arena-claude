@@ -27,6 +27,7 @@ export interface UpstoxQuoteResponse {
   status: string;
   data: {
     [instrumentKey: string]: {
+      instrument_token?: string;
       last_price: number;
       ohlc: {
         open: number;
