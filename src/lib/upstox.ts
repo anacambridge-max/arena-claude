@@ -28,9 +28,15 @@ export class UpstoxService {
     const path = minuteInterval
       ? (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${minuteInterval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${minuteInterval}/${toDate}`)
       : (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}`);
-    const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, { headers: this.authHeaders(), timeout: 10000 });
-    if (response.data.status !== 'success') return [];
-    return (response.data.data?.candles || []).map(candle => ({ timestamp: candle[0], open: candle[1], high: candle[2], low: candle[3], close: candle[4], volume: candle[5] }));
+    try {
+      const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, { headers: this.authHeaders(), timeout: 7000 });
+      if (response.data.status !== 'success') return [];
+      return (response.data.data?.candles || []).map(candle => ({ timestamp: candle[0], open: candle[1], high: candle[2], low: candle[3], close: candle[4], volume: candle[5] }));
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      const apiMessage = axios.isAxiosError(error) ? error.response?.data?.errors?.[0]?.message || error.response?.data?.message : undefined;
+      throw new Error(`Historical candle request failed${status ? ` (${status})` : ''}${apiMessage ? `: ${apiMessage}` : ''}`);
+    }
   }
 
   async getAllNSEFuturesInstruments(): Promise<Record<string, UpstoxFuturesInstrument>> {
