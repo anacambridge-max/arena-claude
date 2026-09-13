@@ -20,7 +20,7 @@ export async function GET() {
 
     const marketStatus = getMarketStatus();
     const fallback = getMockFNOInstruments();
-    const instrumentMap = await upstoxService.getNSEEquityInstruments(fallback.map((i) => i.symbol));
+    const instrumentMap = await upstoxService.getNSEFuturesInstruments(fallback.map((i) => i.symbol));
     const instruments = fallback
       .map((item) => {
         const master = instrumentMap[item.symbol.toUpperCase()];
