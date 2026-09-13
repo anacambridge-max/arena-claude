@@ -10,22 +10,71 @@ import { StockDetailPanel } from './dashboard/stock-detail-panel';
 import { AlertCircle, Loader2 } from 'lucide-react';
 
 interface ScannerResponse {
-  status: string; message?: string;
-  data: { summary: { universeCount: number; scannedCount: number; failedCount?: number; buyCount: number; sellCount: number; setupCount: number; confirmedCount: number; watchCount: number; fakeBreakoutCount: number; noTradeCount: number }; marketStatus: MarketStatus; results: PrimeScanResult[]; generatedAt: string };
+  status: string;
+  error?: string;
+  message?: string;
+  data?: { summary: { universeCount: number; scannedCount: number; failedCount?: number; buyCount: number; sellCount: number; setupCount: number; confirmedCount: number; watchCount: number; fakeBreakoutCount: number; noTradeCount: number }; marketStatus: MarketStatus; results: PrimeScanResult[]; generatedAt: string };
+}
+
+async function readApiResponse<T>(res: Response): Promise<T> {
+  const text = await res.text();
+  if (!text) throw new Error(`Server returned an empty response (HTTP ${res.status}).`);
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    const compact = text.replace(/\s+/g, ' ').slice(0, 180);
+    throw new Error(`Server returned a non-JSON response (HTTP ${res.status}). ${compact}`);
+  }
 }
 
 export function DashboardClient() {
   const [isConnected, setIsConnected] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [scanData, setScanData] = useState<ScannerResponse['data'] | null>(null);
+  const [scanData, setScanData] = useState<NonNullable<ScannerResponse['data']> | null>(null);
   const [selectedStock, setSelectedStock] = useState<PrimeScanResult | null>(null);
   const [lastUpdate, setLastUpdate] = useState<string | null>(null);
 
   useEffect(() => { checkConnection(); }, []);
-  const checkConnection = async () => { try { const res = await fetch('/api/upstox/status', { cache: 'no-store' }); const data = await res.json(); const connected = Boolean(data.data?.connected); setIsConnected(connected); setError(connected ? null : 'UPSTOX_ANALYTICS_TOKEN is not configured on the server.'); } catch { setIsConnected(false); setError('Unable to check Upstox configuration.'); } finally { setIsLoading(false); } };
-  const handleConnect = async () => { setIsLoading(true); setError(null); try { const res = await fetch('/api/upstox/connect', { method: 'POST', cache: 'no-store' }); const data = await res.json(); if (data.status === 'success') { setIsConnected(true); await handleScan(); } else setError(data.message || 'Upstox Analytics Token is not configured.'); } catch { setError('Failed to verify Upstox configuration.'); } finally { setIsLoading(false); } };
-  const handleScan = async () => { setIsLoading(true); setError(null); try { const res = await fetch('/api/upstox/prime-scan', { cache: 'no-store' }); const data: ScannerResponse = await res.json(); if (!res.ok || data.status !== 'success') throw new Error(data.message || 'Failed to run Prime scan'); setScanData(data.data); setLastUpdate(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })); } catch (err) { setError(err instanceof Error ? err.message : 'Failed to run Prime scan'); } finally { setIsLoading(false); } };
+
+  const checkConnection = async () => {
+    try {
+      const res = await fetch('/api/upstox/status', { cache: 'no-store' });
+      const data = await readApiResponse<{ data?: { connected?: boolean }; message?: string }>(res);
+      const connected = Boolean(data.data?.connected);
+      setIsConnected(connected);
+      setError(connected ? null : data.message || 'UPSTOX_ANALYTICS_TOKEN is not configured on the server.');
+    } catch (err) {
+      setIsConnected(false);
+      setError(err instanceof Error ? err.message : 'Unable to check Upstox configuration.');
+    } finally { setIsLoading(false); }
+  };
+
+  const handleConnect = async () => {
+    setIsLoading(true); setError(null);
+    try {
+      const res = await fetch('/api/upstox/connect', { method: 'POST', cache: 'no-store' });
+      const data = await readApiResponse<{ status: string; message?: string }>(res);
+      if (res.ok && data.status === 'success') { setIsConnected(true); await handleScan(); }
+      else setError(data.message || `Upstox verification failed (HTTP ${res.status}).`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to verify Upstox configuration.');
+    } finally { setIsLoading(false); }
+  };
+
+  const handleScan = async () => {
+    setIsLoading(true); setError(null);
+    try {
+      const res = await fetch('/api/upstox/prime-scan', { cache: 'no-store', headers: { Accept: 'application/json' } });
+      const data = await readApiResponse<ScannerResponse>(res);
+      if (!res.ok || data.status !== 'success' || !data.data) throw new Error(data.message || data.error || `Failed to run Prime scan (HTTP ${res.status}).`);
+      setScanData(data.data);
+      setLastUpdate(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to run Prime scan');
+    } finally { setIsLoading(false); }
+  };
+
   const defaultMarketStatus: MarketStatus = { isOpen: false, session: 'CLOSED', currentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }), nextChange: null };
 
   return <div className="min-h-screen bg-slate-950">
