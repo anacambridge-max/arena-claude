@@ -32,19 +32,21 @@ export async function GET() {
       symbol: future.underlying_symbol.toUpperCase(), instrumentKey: future.instrument_key, lotSize: future.lot_size || 1,
     }));
 
+    if (!instruments.length) {
+      return NextResponse.json({ status: 'error', error: 'No active NSE F&O stock futures found in Upstox instrument master.', message: 'Upstox returned an empty F&O stock universe.' }, { status: 503 });
+    }
+
     const quotes = await upstoxService.getMarketQuotes(instruments.map(i => i.instrumentKey));
     const quoteByToken = new Map<string, (typeof quotes)[string]>();
     for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
-
-    const results: ReturnType<typeof runPrimeScan>[] = [];
-    let failedCount = 0;
-    let signalSessionDate: string | null = null;
 
     const scanOne = async (instrument: (typeof instruments)[number]) => {
       const quote = quoteByToken.get(instrument.instrumentKey) ?? quotes[instrument.instrumentKey];
       if (!quote?.last_price) return { ok: false as const };
       try {
-        const fromDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        // Five trading-minute bars need only a small recent window. Keeping this
+        // at five calendar days materially reduces the response payload and scan time.
+        const fromDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
         const raw = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', getTodayDateIST(), fromDate);
         const candles = raw.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
         if (candles.length < 30) return { ok: false as const };
@@ -56,7 +58,6 @@ export async function GET() {
         const previousDayCandles = candles.filter(c => istDate(c.timestamp) === previousDate);
         const sessionCandles = candles.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
         if (!previousDayCandles.length || !sessionCandles.length) return { ok: false as const };
-        signalSessionDate = signalSessionDate || latestDate;
 
         let latestRelevant: ReturnType<typeof runPrimeScan> | null = null;
         for (const candle of sessionCandles) {
@@ -78,7 +79,11 @@ export async function GET() {
       }
     };
 
-    const concurrency = 25;
+    // Run many independent Upstox candle requests concurrently. The previous
+    // 25-at-a-time loop serialized many batches and could hit Vercel timeouts.
+    const concurrency = 100;
+    const results: ReturnType<typeof runPrimeScan>[] = [];
+    let failedCount = 0;
     for (let i = 0; i < instruments.length; i += concurrency) {
       const batch = await Promise.all(instruments.slice(i, i + concurrency).map(scanOne));
       for (const item of batch) {
@@ -93,22 +98,28 @@ export async function GET() {
     const setupCount = rankedResults.filter(r => r.state === 'SETUP').length;
     const watchCount = rankedResults.filter(r => r.state === 'WATCH').length;
     const fakeBreakoutCount = rankedResults.filter(r => r.state === 'FAKE_BREAKOUT').length;
-    const noTradeCount = Math.max(0, instruments.length - rankedResults.length);
+    const noTradeCount = Math.max(0, instruments.length - rankedResults.length - failedCount);
 
     return NextResponse.json({
       status: 'success',
       data: {
         summary: {
-          universeCount: instruments.length, availableCount: instruments.length, scannedCount: instruments.length - failedCount,
+          universeCount: instruments.length, availableCount: instruments.length - failedCount, scannedCount: instruments.length - failedCount,
           failedCount, buyCount, sellCount, setupCount, confirmedCount: buyCount + sellCount, watchCount, fakeBreakoutCount, noTradeCount,
         },
         marketStatus, results: rankedResults, generatedAt: new Date().toISOString(),
         source: 'upstox-analytics-token + PRIME TECHNICAL v3 FAST PRIME', timeframe: '5minute', scanWindow: '09:15-10:00 IST',
-        asOfDate: signalSessionDate || getTodayDateIST(),
+        asOfDate: sessionDatesFromResults(rankedResults) || getTodayDateIST(),
       },
     });
   } catch (error) {
     console.error('Prime scan error:', error);
-    return NextResponse.json({ status: 'error', error: 'Failed to run Prime scan', message: error instanceof Error ? error.message : 'Unknown error' }, { status: 500 });
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return NextResponse.json({ status: 'error', error: 'Failed to run Prime scan', message }, { status: 500 });
   }
+}
+
+function sessionDatesFromResults(results: ReturnType<typeof runPrimeScan>[]) {
+  const dates = results.map(r => r.candle?.timestamp).filter(Boolean).map(ts => istDate(ts as string));
+  return dates.sort().at(-1) || null;
 }
