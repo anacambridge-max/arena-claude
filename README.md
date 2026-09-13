@@ -1,154 +1,175 @@
 # PRIME TECHNICAL MASTER
-## F&O Scanner • Upstox Market Data • Live Signal Workspace
+## F&O Scanner • Upstox Analytics Token • Live Signal Workspace
 
 A professional trading-terminal style dashboard for scanning NSE F&O stocks based on the **Prime Technical** framework.
 
 ---
 
-## 🎯 Overview
+## Overview
 
-This application implements the Prime Technical trading framework for NSE Futures & Options stocks. It analyzes:
+This application implements the Prime Technical trading framework for an NSE F&O-eligible stock universe. It analyzes:
 
 - **LEVEL** - Yesterday High (YH) / Yesterday Low (YL)
 - **REACTION** - Price reaction to key levels
-- **CANDLE** - 5-minute candle structure
-- **VOLUME** - Participation analysis (20-period average)
+- **CANDLE** - 30-minute candle structure from Upstox historical data
+- **VOLUME** - Participation analysis
 - **20 EMA** - Trend context
 - **CONFIRMATION** - Setup validation (not yet verified)
 - **SL** - Structural stop loss
-- **QTY** - Position sizing (requires account settings)
+- **QTY** - Position sizing placeholder
 
-### Core Principle
+Core principle:
 
 > **"Do not trade the line. Trade the reaction to the line."**
 
-The scanner identifies potential setups but does NOT generate automatic trading signals. All confirmations require manual validation.
+The scanner identifies potential setups but does **not** place orders or generate automatic trading instructions.
 
 ---
 
-## 🏗️ Architecture
+## Upstox Authentication
 
+This build uses the **Upstox Analytics Token** directly. No OAuth redirect URL is required. Upstox describes the Analytics Token as a long-lived, read-only credential designed for analytics and market-data applications.
+
+### Required environment variable
+
+```env
+UPSTOX_ANALYTICS_TOKEN=your_analytics_token
 ```
-UPSTOX API
-    ↓
-INSTRUMENT MASTER (F&O Universe)
-    ↓
-MARKET DATA (Historical / Live)
-    ↓
+
+Generate the token in **Upstox Developer Apps → Analytics** and keep it server-side. The browser never receives the token itself.
+
+The application:
+
+1. Downloads Upstox's NSE instrument master and resolves real `NSE_EQ` instrument keys for the configured F&O-eligible symbol universe.
+2. Requests current market quotes in a batched call.
+3. Requests recent 30-minute historical candles per resolved instrument.
+4. Derives the latest available trading session and previous-session YH/YL.
+5. Runs the Prime scanner and ranks the results.
+
+---
+
+## Architecture
+
+```text
+UPSTOX ANALYTICS TOKEN
+        ↓
+UPSTOX NSE INSTRUMENT MASTER
+        ↓
+REAL NSE INSTRUMENT KEYS
+        ↓
+MARKET QUOTES + HISTORICAL CANDLES
+        ↓
 PRIME ENGINE
-    ├── Candle Analysis
-    ├── Volume Analysis
-    ├── EMA Analysis
-    ├── Level Detection
-    └── Reaction Analysis
-    ↓
-SCANNER
-    ↓
-API ENDPOINTS
-    ↓
+  ├── Candle Analysis
+  ├── Volume Analysis
+  ├── EMA Analysis
+  ├── Level Detection
+  └── Reaction Analysis
+        ↓
+SCANNER API
+        ↓
 DASHBOARD
 ```
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
-```
+```text
 src/
 ├── app/
 │   ├── api/
+│   │   ├── health/              # Deployment health check
 │   │   └── upstox/
-│   │       ├── status/          # Connection status
-│   │       ├── connect/         # Mock authentication
-│   │       ├── fno-universe/    # F&O stock list
-│   │       └── prime-scan/      # Main scanner endpoint
-│   ├── page.tsx                 # Dashboard entry point
+│   │       ├── status/          # Analytics Token configuration status
+│   │       ├── connect/         # Verifies server-side Analytics Token
+│   │       ├── fno-universe/    # F&O-eligible symbol list
+│   │       └── prime-scan/      # Real Upstox scanner endpoint
+│   ├── page.tsx
 │   └── layout.tsx
 ├── components/
-│   ├── dashboard-client.tsx     # Main dashboard orchestrator
+│   ├── dashboard-client.tsx
 │   └── dashboard/
-│       ├── header.tsx
-│       ├── market-status-bar.tsx
-│       ├── summary-cards.tsx
-│       ├── scanner-table.tsx
-│       ├── state-badge.tsx
-│       └── stock-detail-panel.tsx
 ├── domain/
-│   ├── prime.ts                 # Prime framework types
-│   └── upstox.ts                # Upstox API types
+│   ├── prime.ts
+│   └── upstox.ts
 ├── engine/
 │   └── prime/
-│       ├── candle.ts            # Candle analysis
-│       ├── volume.ts            # Volume classification
-│       ├── ema.ts               # EMA calculation
-│       ├── levels.ts            # YH/YL detection
-│       ├── reaction.ts          # Reaction analysis
-│       └── scanner.ts           # Main scanner engine
 ├── lib/
-│   ├── upstox.ts                # Upstox service
-│   └── market-utils.ts          # Market timing (IST)
+│   ├── upstox.ts                # Analytics Token service + instrument master
+│   └── market-utils.ts
 └── data/
-    └── fno-universe.ts          # NSE F&O stock list
+    └── fno-universe.ts
 ```
 
 ---
 
-## 🚀 Getting Started
-
-### Prerequisites
-
-- Node.js 18+
-- PostgreSQL (local or remote)
-- Upstox API credentials (optional for demo mode)
+## Getting Started
 
 ### Installation
 
 ```bash
-# Install dependencies
 npm install
-
-# Copy environment template
-cp .env.example .env
-
-# Configure database
-# Edit .env and set DATABASE_URL
-
-# Apply database schema (if needed)
-npx drizzle-kit push
-
-# Run development server
 npm run dev
 ```
 
-Visit `http://localhost:3000`
+Visit `http://localhost:3000`.
 
----
+### Environment
 
-## 🔐 Upstox Integration
-
-### Development Mode (Mock)
-
-The scanner works in **demo mode** without real Upstox credentials. Click "Connect Upstox" to activate mock data.
-
-### Production Mode (Real Data)
-
-1. Create Upstox App: https://account.upstox.com/developer/apps
-2. Get API Key and API Secret
-3. Add to `.env`:
+Copy `.env.example` to `.env.local` and set:
 
 ```env
-UPSTOX_API_KEY=your_api_key
-UPSTOX_API_SECRET=your_api_secret
+UPSTOX_ANALYTICS_TOKEN=your_analytics_token
 ```
 
-**IMPORTANT**: 
-- Credentials are kept **strictly server-side**
-- Never expose tokens to client
-- Never commit `.env` to Git
+The Analytics Token must stay server-side.
 
 ---
 
-## 📊 Scanner States
+## Vercel Deployment
+
+This repository is prepared for Vercel deployment.
+
+In the Vercel project, add this environment variable for **Production**, **Preview**, and **Development** as needed:
+
+```text
+UPSTOX_ANALYTICS_TOKEN
+```
+
+No Upstox OAuth redirect URL is needed for this Analytics Token architecture.
+
+After deployment, verify:
+
+```text
+/api/health
+/api/upstox/status
+```
+
+Then use **VERIFY UPSTOX** and **SCAN NOW** in the dashboard.
+
+---
+
+## API Endpoints
+
+### `GET /api/health`
+Returns deployment health and whether the server has an Analytics Token configured.
+
+### `GET /api/upstox/status`
+Checks whether the Analytics Token is configured without returning the secret itself.
+
+### `POST /api/upstox/connect`
+Verifies that the server-side Analytics Token is configured.
+
+### `GET /api/upstox/fno-universe`
+Returns the configured NSE F&O-eligible symbol list.
+
+### `GET /api/upstox/prime-scan`
+Resolves real Upstox instrument keys, fetches quotes and recent historical candles, runs the Prime scanner, and returns ranked dashboard results.
+
+---
+
+## Scanner States
 
 | State | Description |
 |-------|-------------|
@@ -161,189 +182,28 @@ UPSTOX_API_SECRET=your_api_secret
 
 ---
 
-## ⚠️ Important Disclaimers
+## Important Limitations
 
-### 1. Unverified Formulas
-
-The following formulas are **NOT VERIFIED** from the Prime Technical source material:
+The following formulas/rules remain explicitly **unverified** and are not invented by the scanner:
 
 - MID calculation
-- R1, R2, R3 resistance levels
-- S1, S2, S3 support levels
+- R1/R2/R3
+- S1/S2/S3
 - Exact confirmation criteria
 
-These are marked as "RULE NOT VERIFIED" in the UI.
-
-### 2. No Automatic Trading Signals
-
-This scanner does **NOT**:
-- Generate automatic BUY/SELL signals
-- Execute trades
-- Provide investment advice
-- Guarantee profitability
-
-### 3. Educational Purpose
-
-This tool is for:
-- Learning the Prime Technical framework
-- Identifying potential setups for manual analysis
-- Educational and research purposes only
-
-**NOT FOR LIVE TRADING WITHOUT PROPER VALIDATION**
+The scanner therefore keeps confirmation as a waiting stage and does not turn unverified conditions into automatic trading signals.
 
 ---
 
-## 🎨 Dashboard Features
+## Security
 
-### Header
-- Connection status
-- Refresh controls
-- Last update timestamp
-
-### Market Status Bar
-- NSE market hours (09:15 - 15:30 IST)
-- Current session (PRE_MARKET / OPEN / CLOSED)
-- Real-time IST clock
-
-### Summary Cards
-- F&O Universe count
-- Buy/Sell candidates
-- Setup counts by state
-
-### Scanner Table
-Columns:
-- Rank, Stock, LTP, Day %
-- YH, YL, Location
-- Reaction, Candle, Volume
-- 20 EMA, State
-- Entry, SL, Reason
-
-### Stock Detail Panel
-- Prime Pipeline (stage-by-stage)
-- Level Analysis
-- 5-Minute Candle breakdown
-- Volume metrics
-- EMA analysis
-- Reaction details
-- Risk calculation
+- Analytics Token is server-side only.
+- Token is never returned by dashboard API responses.
+- No OAuth redirect flow is used.
+- Do not commit `.env`, `.env.local`, or the real token.
 
 ---
 
-## 🔧 API Endpoints
+## Disclaimer
 
-### `GET /api/upstox/status`
-Check Upstox connection status
-
-### `POST /api/upstox/connect`
-Connect to Upstox (demo mode)
-
-### `GET /api/upstox/fno-universe`
-Get NSE F&O stock list
-
-### `GET /api/upstox/prime-scan`
-Run Prime scanner on F&O universe
-
-Returns:
-```json
-{
-  "status": "success",
-  "data": {
-    "summary": { ... },
-    "marketStatus": { ... },
-    "results": [ ... ],
-    "generatedAt": "2024-01-01T10:00:00Z"
-  }
-}
-```
-
----
-
-## 🧪 Development
-
-### Type Checking
-```bash
-npm run typecheck
-```
-
-### Build
-```bash
-npm run build
-```
-
-### Production
-```bash
-npm run start
-```
-
----
-
-## 📖 Prime Technical Principles
-
-### Volume Rating
-- **NORMAL**: Below 2x average
-- **★ (STAR_1)**: 2x average
-- **★★ (STAR_2)**: 4x average
-- **★★★ (STAR_3)**: 6.5x average
-
-### Candle Analysis
-- Range, Body, Wicks
-- Body % of range
-- Close location (0-100)
-- Bullish/Bearish/Doji classification
-
-### Reaction Types
-- **REJECTION**: Price bounces off level
-- **BREAKOUT**: Price breaks through level
-- **ACCEPTANCE**: Price accepts level
-- **NONE**: No clear pattern
-
-### Fake Breakout Logic
-1. Price breaks level
-2. Fails to hold
-3. Closes back inside
-4. Triggers opposite setup
-
----
-
-## 🛡️ Security
-
-- All Upstox credentials server-side only
-- No tokens in client JavaScript
-- No tokens in API responses
-- Environment variables not committed
-- `.data/` directory in `.gitignore`
-
----
-
-## 📝 License
-
-This project is for educational purposes. Not licensed for commercial use without proper validation.
-
----
-
-## 🤝 Contributing
-
-This is a private repository. For issues or enhancements, contact the repository owner.
-
----
-
-## ⚡ Performance Notes
-
-- Scanner processes 100+ F&O stocks
-- Server-side aggregation (not client-side)
-- Mock data for development
-- Real Upstox integration requires proper rate limiting
-- Consider worker process for live WebSocket feeds
-
----
-
-## 📞 Support
-
-For questions about:
-- **Prime Technical Framework**: Refer to course material
-- **Upstox API**: https://upstox.com/developer/api-documentation
-- **Technical Issues**: Create an issue in the repository
-
----
-
-**Built with Next.js 16, Tailwind CSS, TypeScript, and ❤️**
+This project is for educational and research purposes. The Prime confirmation rules are not fully verified from source material. Do not use the output as investment advice or as an unattended trading system.
