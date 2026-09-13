@@ -27,6 +27,7 @@ export async function GET() {
         return master ? { ...item, instrumentKey: master.instrument_key, lotSize: master.lot_size || item.lotSize } : null;
       })
       .filter((item): item is NonNullable<typeof item> => Boolean(item));
+
     const keys = instruments.map((i) => i.instrumentKey);
     const quotes = await upstoxService.getMarketQuotes(keys);
 
@@ -39,7 +40,12 @@ export async function GET() {
     const toDate = getTodayDateIST();
 
     const scanOne = async (instrument: (typeof instruments)[number]) => {
-      const quote = quotes[instrument.instrumentKey];
+      // Upstox market-quote response keys are EXCHANGE:SYMBOL, while
+      // instrument_key values use EXCHANGE|TOKEN. Resolve by token first,
+      // then fall back to the colon form returned by the API.
+      const quote = quotes[instrument.instrumentKey]
+        ?? quotes[instrument.instrumentKey.replace('|', ':')];
+
       if (!quote?.last_price) return { ok: false as const };
 
       try {
@@ -97,7 +103,8 @@ export async function GET() {
 
     const rankedResults = rankScanResults(results);
     const summary = {
-      universeCount: instruments.length,
+      universeCount: fallback.length,
+      availableCount: instruments.length,
       scannedCount: rankedResults.length,
       failedCount,
       buyCount: rankedResults.filter((r) => r.direction === 'BULLISH' && r.state !== 'NO_TRADE').length,
