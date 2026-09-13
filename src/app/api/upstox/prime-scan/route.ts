@@ -43,11 +43,17 @@ export async function GET() {
       if (!quote?.last_price) return { ok: false as const, reason: 'quote' };
 
       try {
-        const candles = await upstoxService.getHistoricalCandles(
+        const rawCandles = await upstoxService.getHistoricalCandles(
           instrument.instrumentKey,
           '30minute',
           toDate,
           fromDate,
+        );
+
+        // Upstox may return historical candles newest-first. The Prime engine
+        // expects chronological order, so normalize before selecting sessions.
+        const candles = rawCandles.slice().sort(
+          (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
         );
 
         if (candles.length < 22) return { ok: false as const, reason: 'candles' };
