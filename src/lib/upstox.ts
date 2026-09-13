@@ -12,6 +12,19 @@ import type { Candle } from '@/domain/prime';
 const UPSTOX_API_BASE = 'https://api.upstox.com/v2';
 const NSE_INSTRUMENTS_URL = 'https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz';
 
+export interface UpstoxFuturesInstrument {
+  segment: string;
+  name: string;
+  exchange: string;
+  instrument_type: string;
+  instrument_key: string;
+  trading_symbol: string;
+  underlying_symbol: string;
+  lot_size: number;
+  expiry: string | number;
+  weekly?: boolean;
+}
+
 export interface UpstoxEquityInstrument {
   segment: string;
   name: string;
@@ -74,6 +87,34 @@ export class UpstoxService {
       close: candle[4],
       volume: candle[5],
     }));
+  }
+
+  async getNSEFuturesInstruments(symbols: string[]): Promise<Record<string, UpstoxFuturesInstrument>> {
+    const response = await axios.get<ArrayBuffer>(NSE_INSTRUMENTS_URL, {
+      responseType: 'arraybuffer',
+      timeout: 20000,
+    });
+    const json = gunzipSync(Buffer.from(response.data)).toString('utf8');
+    const rows = JSON.parse(json) as UpstoxFuturesInstrument[];
+    const wanted = new Set(symbols.map((symbol) => symbol.toUpperCase()));
+    const now = Date.now();
+    const result: Record<string, UpstoxFuturesInstrument> = {};
+
+    for (const row of rows) {
+      if (row.segment !== 'NSE_FO' || row.instrument_type !== 'FUT') continue;
+      if (!wanted.has((row.underlying_symbol || '').toUpperCase())) continue;
+      const expiryMs = typeof row.expiry === 'number' ? row.expiry : Date.parse(row.expiry);
+      if (!Number.isFinite(expiryMs) || expiryMs < now) continue;
+      const key = row.underlying_symbol.toUpperCase();
+      const current = result[key];
+      if (!current) {
+        result[key] = row;
+        continue;
+      }
+      const currentExpiry = typeof current.expiry === 'number' ? current.expiry : Date.parse(current.expiry);
+      if (expiryMs < currentExpiry) result[key] = row;
+    }
+    return result;
   }
 
   async getNSEEquityInstruments(symbols: string[]): Promise<Record<string, UpstoxEquityInstrument>> {
