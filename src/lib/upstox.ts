@@ -3,7 +3,6 @@
  * The token is supplied only through UPSTOX_ANALYTICS_TOKEN and is never
  * returned to the browser.
  */
-
 import axios from 'axios';
 import { gunzipSync } from 'node:zlib';
 import type { UpstoxHistoricalCandleResponse, UpstoxQuoteResponse } from '@/domain/upstox';
@@ -43,81 +42,59 @@ export class UpstoxService {
 
   constructor() {
     this.analyticsToken = process.env.UPSTOX_ANALYTICS_TOKEN?.trim() || '';
-    if (!this.analyticsToken) {
-      console.warn('UPSTOX_ANALYTICS_TOKEN is not configured');
-    }
+    if (!this.analyticsToken) console.warn('UPSTOX_ANALYTICS_TOKEN is not configured');
   }
 
-  isConfigured(): boolean {
-    return Boolean(this.analyticsToken);
-  }
-
-  isAuthenticated(): boolean {
-    return this.isConfigured();
-  }
+  isConfigured(): boolean { return Boolean(this.analyticsToken); }
+  isAuthenticated(): boolean { return this.isConfigured(); }
 
   private authHeaders() {
     if (!this.analyticsToken) throw new Error('UPSTOX_ANALYTICS_TOKEN is not configured');
-    return {
-      Authorization: `Bearer ${this.analyticsToken}`,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    };
+    return { Authorization: `Bearer ${this.analyticsToken}`, Accept: 'application/json', 'Content-Type': 'application/json' };
   }
 
   async getHistoricalCandles(
     instrumentKey: string,
-    interval: '1minute' | '30minute' | 'day' | 'week' | 'month',
+    interval: '1minute' | '5minute' | '30minute' | 'day' | 'week' | 'month',
     toDate: string,
     fromDate?: string,
   ): Promise<Candle[]> {
-    const path = fromDate
-      ? `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${interval === '30minute' ? 30 : interval === '1minute' ? 1 : interval}/${toDate}/${fromDate}`
-      : `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${interval === '30minute' ? 30 : interval === '1minute' ? 1 : interval}/${toDate}`;
+    const minuteInterval = interval === '1minute' ? '1' : interval === '5minute' ? '5' : interval === '30minute' ? '30' : null;
+    const path = minuteInterval
+      ? (fromDate
+        ? `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${minuteInterval}/${toDate}/${fromDate}`
+        : `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${minuteInterval}/${toDate}`)
+      : (fromDate
+        ? `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}`
+        : `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}`);
 
-    // V3 supports custom minute intervals such as 30 minutes.
     const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, {
-      headers: this.authHeaders(),
-      timeout: 15000,
+      headers: this.authHeaders(), timeout: 10000,
     });
-
     if (response.data.status !== 'success') return [];
-    return (response.data.data?.candles || []).map((candle: UpstoxHistoricalCandleResponse['data']['candles'][number]) => ({
-      timestamp: candle[0],
-      open: candle[1],
-      high: candle[2],
-      low: candle[3],
-      close: candle[4],
-      volume: candle[5],
+    return (response.data.data?.candles || []).map((candle) => ({
+      timestamp: candle[0], open: candle[1], high: candle[2], low: candle[3], close: candle[4], volume: candle[5],
     }));
   }
 
   async getAllNSEFuturesInstruments(): Promise<Record<string, UpstoxFuturesInstrument>> {
-    const response = await axios.get<ArrayBuffer>(NSE_INSTRUMENTS_URL, {
-      responseType: 'arraybuffer',
-      timeout: 20000,
-    });
-    const json = gunzipSync(Buffer.from(response.data)).toString('utf8');
-    const rows = JSON.parse(json) as UpstoxFuturesInstrument[];
+    const response = await axios.get<ArrayBuffer>(NSE_INSTRUMENTS_URL, { responseType: 'arraybuffer', timeout: 20000 });
+    const rows = JSON.parse(gunzipSync(Buffer.from(response.data)).toString('utf8')) as UpstoxFuturesInstrument[];
     const now = Date.now();
     const result: Record<string, UpstoxFuturesInstrument> = {};
-
     for (const row of rows) {
       if (row.segment !== 'NSE_FO' || row.instrument_type !== 'FUT') continue;
-      // Only stock futures. Exclude NIFTY/BANKNIFTY/etc. index futures.
       if (row.underlying_type && row.underlying_type !== 'EQUITY') continue;
       if (!row.underlying_symbol) continue;
       const expiryMs = typeof row.expiry === 'number' ? row.expiry : Date.parse(row.expiry);
       if (!Number.isFinite(expiryMs) || expiryMs < now) continue;
-
       const key = row.underlying_symbol.toUpperCase();
       const current = result[key];
-      if (!current) {
-        result[key] = row;
-        continue;
+      if (!current) result[key] = row;
+      else {
+        const currentExpiry = typeof current.expiry === 'number' ? current.expiry : Date.parse(current.expiry);
+        if (expiryMs < currentExpiry) result[key] = row;
       }
-      const currentExpiry = typeof current.expiry === 'number' ? current.expiry : Date.parse(current.expiry);
-      if (expiryMs < currentExpiry) result[key] = row;
     }
     return result;
   }
@@ -129,38 +106,28 @@ export class UpstoxService {
   }
 
   async getNSEEquityInstruments(symbols: string[]): Promise<Record<string, UpstoxEquityInstrument>> {
-    const response = await axios.get<ArrayBuffer>(NSE_INSTRUMENTS_URL, {
-      responseType: 'arraybuffer',
-      timeout: 20000,
-    });
-    const json = gunzipSync(Buffer.from(response.data)).toString('utf8');
-    const rows = JSON.parse(json) as UpstoxEquityInstrument[];
+    const response = await axios.get<ArrayBuffer>(NSE_INSTRUMENTS_URL, { responseType: 'arraybuffer', timeout: 20000 });
+    const rows = JSON.parse(gunzipSync(Buffer.from(response.data)).toString('utf8')) as UpstoxEquityInstrument[];
     const wanted = new Set(symbols.map((symbol) => symbol.toUpperCase()));
     const result: Record<string, UpstoxEquityInstrument> = {};
     for (const row of rows) {
       if (row.segment !== 'NSE_EQ' || row.instrument_type !== 'EQ') continue;
-      if (!wanted.has((row.trading_symbol || '').toUpperCase())) continue;
-      result[row.trading_symbol.toUpperCase()] = row;
+      if (wanted.has((row.trading_symbol || '').toUpperCase())) result[row.trading_symbol.toUpperCase()] = row;
     }
     return result;
   }
 
   async getMarketQuotes(instrumentKeys: string[]): Promise<UpstoxQuoteResponse['data']> {
-    if (instrumentKeys.length === 0) return {};
-    const chunks: string[][] = [];
-    for (let i = 0; i < instrumentKeys.length; i += 500) chunks.push(instrumentKeys.slice(i, i + 500));
-
+    if (!instrumentKeys.length) return {};
     const merged: UpstoxQuoteResponse['data'] = {};
-    for (const chunk of chunks) {
+    for (let i = 0; i < instrumentKeys.length; i += 500) {
+      const chunk = instrumentKeys.slice(i, i + 500);
       const response = await axios.get<UpstoxQuoteResponse>(`${UPSTOX_API_BASE}/market-quote/quotes`, {
-        params: { instrument_key: chunk.join(',') },
-        headers: this.authHeaders(),
-        timeout: 15000,
+        params: { instrument_key: chunk.join(',') }, headers: this.authHeaders(), timeout: 10000,
       });
       if (response.data.status === 'success') {
-        for (const [responseKey, quote] of Object.entries(response.data.data || {})) {
-          // Keep both the API response key and the canonical instrument token.
-          merged[responseKey] = quote;
+        for (const [key, quote] of Object.entries(response.data.data || {})) {
+          merged[key] = quote;
           if (quote.instrument_token) merged[quote.instrument_token] = quote;
         }
       }
