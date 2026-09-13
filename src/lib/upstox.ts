@@ -10,6 +10,7 @@ import type { UpstoxHistoricalCandleResponse, UpstoxQuoteResponse } from '@/doma
 import type { Candle } from '@/domain/prime';
 
 const UPSTOX_API_BASE = 'https://api.upstox.com/v2';
+const UPSTOX_API_V3_BASE = 'https://api.upstox.com/v3';
 const NSE_INSTRUMENTS_URL = 'https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz';
 
 export interface UpstoxFuturesInstrument {
@@ -20,6 +21,7 @@ export interface UpstoxFuturesInstrument {
   instrument_key: string;
   trading_symbol: string;
   underlying_symbol: string;
+  underlying_type?: string;
   lot_size: number;
   expiry: string | number;
   weekly?: boolean;
@@ -70,10 +72,11 @@ export class UpstoxService {
     fromDate?: string,
   ): Promise<Candle[]> {
     const path = fromDate
-      ? `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}`
-      : `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}`;
+      ? `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${interval === '30minute' ? 30 : interval === '1minute' ? 1 : interval}/${toDate}/${fromDate}`
+      : `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${interval === '30minute' ? 30 : interval === '1minute' ? 1 : interval}/${toDate}`;
 
-    const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_BASE}${path}`, {
+    // V3 supports custom minute intervals such as 30 minutes.
+    const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, {
       headers: this.authHeaders(),
       timeout: 15000,
     });
@@ -89,22 +92,24 @@ export class UpstoxService {
     }));
   }
 
-  async getNSEFuturesInstruments(symbols: string[]): Promise<Record<string, UpstoxFuturesInstrument>> {
+  async getAllNSEFuturesInstruments(): Promise<Record<string, UpstoxFuturesInstrument>> {
     const response = await axios.get<ArrayBuffer>(NSE_INSTRUMENTS_URL, {
       responseType: 'arraybuffer',
       timeout: 20000,
     });
     const json = gunzipSync(Buffer.from(response.data)).toString('utf8');
     const rows = JSON.parse(json) as UpstoxFuturesInstrument[];
-    const wanted = new Set(symbols.map((symbol) => symbol.toUpperCase()));
     const now = Date.now();
     const result: Record<string, UpstoxFuturesInstrument> = {};
 
     for (const row of rows) {
       if (row.segment !== 'NSE_FO' || row.instrument_type !== 'FUT') continue;
-      if (!wanted.has((row.underlying_symbol || '').toUpperCase())) continue;
+      // Only stock futures. Exclude NIFTY/BANKNIFTY/etc. index futures.
+      if (row.underlying_type && row.underlying_type !== 'EQUITY') continue;
+      if (!row.underlying_symbol) continue;
       const expiryMs = typeof row.expiry === 'number' ? row.expiry : Date.parse(row.expiry);
       if (!Number.isFinite(expiryMs) || expiryMs < now) continue;
+
       const key = row.underlying_symbol.toUpperCase();
       const current = result[key];
       if (!current) {
@@ -115,6 +120,12 @@ export class UpstoxService {
       if (expiryMs < currentExpiry) result[key] = row;
     }
     return result;
+  }
+
+  async getNSEFuturesInstruments(symbols: string[]): Promise<Record<string, UpstoxFuturesInstrument>> {
+    const all = await this.getAllNSEFuturesInstruments();
+    const wanted = new Set(symbols.map((symbol) => symbol.toUpperCase()));
+    return Object.fromEntries(Object.entries(all).filter(([symbol]) => wanted.has(symbol)));
   }
 
   async getNSEEquityInstruments(symbols: string[]): Promise<Record<string, UpstoxEquityInstrument>> {
@@ -146,7 +157,13 @@ export class UpstoxService {
         headers: this.authHeaders(),
         timeout: 15000,
       });
-      if (response.data.status === 'success') Object.assign(merged, response.data.data || {});
+      if (response.data.status === 'success') {
+        for (const [responseKey, quote] of Object.entries(response.data.data || {})) {
+          // Keep both the API response key and the canonical instrument token.
+          merged[responseKey] = quote;
+          if (quote.instrument_token) merged[quote.instrument_token] = quote;
+        }
+      }
     }
     return merged;
   }
