@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { upstoxService } from '@/lib/upstox';
 import { getMarketStatus, getCurrentISTTime, getTodayDateIST } from '@/lib/market-utils';
-import { getMockFNOInstruments } from '@/data/fno-universe';
 import { runPrimeScan, rankScanResults, type ScannerInput } from '@/engine/prime/scanner';
 import type { Candle } from '@/domain/prime';
 
@@ -19,29 +18,20 @@ export async function GET() {
     }
 
     const marketStatus = getMarketStatus();
-    const fallback = getMockFNOInstruments();
-    const instrumentMap = await upstoxService.getNSEFuturesInstruments(fallback.map((i) => i.symbol));
-    const instruments = fallback
-      .map((item) => {
-        const master = instrumentMap[item.symbol.toUpperCase()];
-        return master ? { ...item, instrumentKey: master.instrument_key, lotSize: master.lot_size || item.lotSize } : null;
-      })
-      .filter((item): item is NonNullable<typeof item> => Boolean(item));
+    // Discover the complete current stock-F&O universe from Upstox's live NSE
+    // instrument master. No hard-coded stock list is used for scanning.
+    const futures = await upstoxService.getAllNSEFuturesInstruments();
+    const instruments = Object.values(futures).map((future) => ({
+      symbol: future.underlying_symbol.toUpperCase(),
+      instrumentKey: future.instrument_key,
+      lotSize: future.lot_size || 1,
+    }));
 
     const keys = instruments.map((i) => i.instrumentKey);
     const quotes = await upstoxService.getMarketQuotes(keys);
 
-    // Upstox returns market-quote objects keyed by EXCHANGE:SYMBOL, while
-    // each object also carries the requested instrument_token in pipe form.
-    // Build a token index so F&O futures are matched reliably regardless of
-    // the response object's display-key format.
-    const quoteByToken = new Map<string, (typeof quotes)[string]>();
-    for (const quote of Object.values(quotes)) {
-      if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
-    }
-
     const results: ReturnType<typeof runPrimeScan>[] = [];
-    let failedCount = fallback.length - instruments.length;
+    let failedCount = 0;
     const now = getCurrentISTTime();
     const from = new Date(now);
     from.setDate(from.getDate() - 5);
@@ -49,11 +39,8 @@ export async function GET() {
     const toDate = getTodayDateIST();
 
     const scanOne = async (instrument: (typeof instruments)[number]) => {
-      const quote = quoteByToken.get(instrument.instrumentKey)
-        ?? quotes[instrument.instrumentKey]
-        ?? quotes[instrument.instrumentKey.replace('|', ':')];
-
-      if (!quote?.last_price) return { ok: false as const };
+      const quote = quotes[instrument.instrumentKey];
+      if (!quote?.last_price) return { ok: false as const, reason: 'quote' };
 
       try {
         const candles = await upstoxService.getHistoricalCandles(
@@ -63,7 +50,7 @@ export async function GET() {
           fromDate,
         );
 
-        if (candles.length < 22) return { ok: false as const };
+        if (candles.length < 22) return { ok: false as const, reason: 'candles' };
 
         const currentCandle: Candle = candles[candles.length - 1];
         const historicalCandles = candles.slice(-30);
@@ -76,7 +63,7 @@ export async function GET() {
           ? candles.filter((c) => c.timestamp.slice(0, 10) === previousSessionDate)
           : [];
 
-        if (previousDayCandles.length === 0) return { ok: false as const };
+        if (previousDayCandles.length === 0) return { ok: false as const, reason: 'previous-day' };
 
         const input: ScannerInput = {
           symbol: instrument.symbol,
@@ -94,8 +81,8 @@ export async function GET() {
 
         return { ok: true as const, result: runPrimeScan(input) };
       } catch (error) {
-        console.error(`Scan failed for ${instrument.symbol}`, error);
-        return { ok: false as const };
+        console.error(`Scan failed for ${instrument.symbol}:`, error);
+        return { ok: false as const, reason: 'error' };
       }
     };
 
@@ -110,7 +97,7 @@ export async function GET() {
 
     const rankedResults = rankScanResults(results);
     const summary = {
-      universeCount: fallback.length,
+      universeCount: instruments.length,
       availableCount: instruments.length,
       scannedCount: rankedResults.length,
       failedCount,
