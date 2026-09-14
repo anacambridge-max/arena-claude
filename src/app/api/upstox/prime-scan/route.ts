@@ -34,14 +34,12 @@ export async function GET() {
     const futures = await upstoxService.getAllNSEFuturesInstruments();
     const symbols = Object.keys(futures);
     const equities = await upstoxService.getNSEEquityInstruments(symbols);
-    const instruments = symbols
-      .map(symbol => {
-        const future = futures[symbol];
-        const equity = equities[symbol];
-        if (!equity) return null;
-        return { symbol, instrumentKey: equity.instrument_key, lotSize: future.lot_size || 1, futuresInstrumentKey: future.instrument_key };
-      })
-      .filter((item): item is NonNullable<typeof item> => Boolean(item));
+    const instruments = symbols.map(symbol => {
+      const future = futures[symbol];
+      const equity = equities[symbol];
+      if (!equity) return null;
+      return { symbol, instrumentKey: equity.instrument_key, lotSize: future.lot_size || 1, futuresInstrumentKey: future.instrument_key };
+    }).filter((item): item is NonNullable<typeof item> => Boolean(item));
 
     if (!instruments.length) {
       return NextResponse.json({ status: 'error', error: 'No NSE equity instruments matched the active F&O stock universe.', message: 'Upstox returned no underlying NSE cash instruments for the F&O universe.' }, { status: 503 });
@@ -51,9 +49,7 @@ export async function GET() {
     const quoteByToken = new Map<string, (typeof quotes)[string]>();
     for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-    // Five trading days is enough warm-up for EMA20, volume SMA20 and range SMA10,
-    // while keeping the server response fast. It also avoids downloading a month
-    // of candles for every one of the ~210 F&O stocks.
+    // Five trading days is enough warm-up for EMA20, volume SMA20 and range SMA10.
     const fromDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
     const scanOne = async (instrument: (typeof instruments)[number]) => {
@@ -98,7 +94,9 @@ export async function GET() {
       }
     };
 
-    const concurrency = 100;
+    // Upstox currently limits standard APIs, including historical candles, to 50 requests/sec.
+    // 40 concurrent requests keeps a safety margin and prevents 429s/connection overloads.
+    const concurrency = 40;
     const results: ReturnType<typeof runPrimeScan>[] = [];
     let failedCount = 0;
     for (let i = 0; i < instruments.length; i += concurrency) {
@@ -117,19 +115,16 @@ export async function GET() {
     const fakeBreakoutCount = rankedResults.filter(r => r.state === 'FAKE_BREAKOUT').length;
     const noTradeCount = Math.max(0, instruments.length - rankedResults.length - failedCount);
 
-    return NextResponse.json({
-      status: 'success',
-      data: {
-        summary: { universeCount: instruments.length, availableCount: instruments.length - failedCount, scannedCount: instruments.length - failedCount, failedCount, buyCount, sellCount, setupCount, confirmedCount: buyCount + sellCount, watchCount, fakeBreakoutCount, noTradeCount },
-        marketStatus,
-        results: rankedResults,
-        generatedAt: new Date().toISOString(),
-        source: 'upstox-analytics-token + NSE_EQ candles + PRIME TECHNICAL v3 FAST PRIME',
-        timeframe: '5minute',
-        scanWindow: '09:15-10:00 IST',
-        asOfDate: sessionDatesFromResults(rankedResults) || getTodayDateIST(),
-      },
-    });
+    return NextResponse.json({ status: 'success', data: {
+      summary: { universeCount: instruments.length, availableCount: instruments.length - failedCount, scannedCount: instruments.length - failedCount, failedCount, buyCount, sellCount, setupCount, confirmedCount: buyCount + sellCount, watchCount, fakeBreakoutCount, noTradeCount },
+      marketStatus,
+      results: rankedResults,
+      generatedAt: new Date().toISOString(),
+      source: 'upstox-analytics-token + NSE_EQ candles + PRIME TECHNICAL v3 FAST PRIME',
+      timeframe: '5minute',
+      scanWindow: '09:15-10:00 IST',
+      asOfDate: sessionDatesFromResults(rankedResults) || getTodayDateIST(),
+    }});
   } catch (error) {
     console.error('Prime scan error:', error);
     const message = error instanceof Error ? error.message : 'Unknown error';
