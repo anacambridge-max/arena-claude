@@ -41,7 +41,7 @@ export class UpstoxService {
       ? (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${minuteInterval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${minuteInterval}/${toDate}`)
       : (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}`);
     try {
-      const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, { headers: this.authHeaders(), timeout: 8000 });
+      const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, { headers: this.authHeaders(), timeout: 7000 });
       if (response.data.status !== 'success') return [];
       return (response.data.data?.candles || []).map(candle => ({ timestamp: candle[0], open: candle[1], high: candle[2], low: candle[3], close: candle[4], volume: candle[5] }));
     } catch (error) {
