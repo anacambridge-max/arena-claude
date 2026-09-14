@@ -28,10 +28,9 @@ export async function GET() {
 
     const marketStatus = getMarketStatus();
 
-    // F&O futures define the eligible stock universe and preserve lot size,
-    // but ALL Pine calculations must run on the underlying NSE cash/equity
-    // chart. This is what makes the scanner comparable with TradingView's
-    // NSE:SYMBOL 5-minute chart.
+    // F&O futures define the eligible stock universe and preserve lot size.
+    // Pine calculations themselves run on the underlying NSE cash/equity chart
+    // so TradingView NSE:SYMBOL 5-minute signals can be reproduced.
     const futures = await upstoxService.getAllNSEFuturesInstruments();
     const symbols = Object.keys(futures);
     const equities = await upstoxService.getNSEEquityInstruments(symbols);
@@ -40,12 +39,7 @@ export async function GET() {
         const future = futures[symbol];
         const equity = equities[symbol];
         if (!equity) return null;
-        return {
-          symbol,
-          instrumentKey: equity.instrument_key,
-          lotSize: future.lot_size || 1,
-          futuresInstrumentKey: future.instrument_key,
-        };
+        return { symbol, instrumentKey: equity.instrument_key, lotSize: future.lot_size || 1, futuresInstrumentKey: future.instrument_key };
       })
       .filter((item): item is NonNullable<typeof item> => Boolean(item));
 
@@ -61,8 +55,10 @@ export async function GET() {
       const quote = quoteByToken.get(instrument.instrumentKey) ?? quotes[instrument.instrumentKey];
       if (!quote?.last_price) return { ok: false as const };
       try {
-        const fromDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-        // IMPORTANT: use NSE_EQ key, not the futures key, for exact Pine parity.
+        // Keep the full one-month 5-minute history allowed by Upstox. Pine's
+        // EMA20 is calculated from a much longer chart history than 5 days;
+        // using one month materially reduces warm-up drift and improves parity.
+        const fromDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
         const raw = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', getTodayDateIST(), fromDate);
         const candles = raw.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
         if (candles.length < 30) return { ok: false as const };
@@ -122,19 +118,7 @@ export async function GET() {
     return NextResponse.json({
       status: 'success',
       data: {
-        summary: {
-          universeCount: instruments.length,
-          availableCount: instruments.length - failedCount,
-          scannedCount: instruments.length - failedCount,
-          failedCount,
-          buyCount,
-          sellCount,
-          setupCount,
-          confirmedCount: buyCount + sellCount,
-          watchCount,
-          fakeBreakoutCount,
-          noTradeCount,
-        },
+        summary: { universeCount: instruments.length, availableCount: instruments.length - failedCount, scannedCount: instruments.length - failedCount, failedCount, buyCount, sellCount, setupCount, confirmedCount: buyCount + sellCount, watchCount, fakeBreakoutCount, noTradeCount },
         marketStatus,
         results: rankedResults,
         generatedAt: new Date().toISOString(),
