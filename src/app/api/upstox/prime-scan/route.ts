@@ -20,6 +20,10 @@ function isPrimeWindow(timestamp: string) {
   return m >= 9 * 60 + 15 && m < 10 * 60;
 }
 
+function signalPriority(state: ReturnType<typeof runPrimeScan>['state']) {
+  return state === 'CONFIRMED' ? 4 : state === 'FAKE_BREAKOUT' ? 3 : state === 'SETUP' ? 2 : state === 'WATCH' ? 1 : 0;
+}
+
 export async function GET() {
   try {
     if (!upstoxService.isAuthenticated()) {
@@ -27,10 +31,6 @@ export async function GET() {
     }
 
     const marketStatus = getMarketStatus();
-
-    // F&O futures define the eligible stock universe and preserve lot size.
-    // Pine calculations themselves run on the underlying NSE cash/equity chart
-    // so TradingView NSE:SYMBOL 5-minute signals can be reproduced.
     const futures = await upstoxService.getAllNSEFuturesInstruments();
     const symbols = Object.keys(futures);
     const equities = await upstoxService.getNSEEquityInstruments(symbols);
@@ -55,9 +55,7 @@ export async function GET() {
       const quote = quoteByToken.get(instrument.instrumentKey) ?? quotes[instrument.instrumentKey];
       if (!quote?.last_price) return { ok: false as const };
       try {
-        // Keep the full one-month 5-minute history allowed by Upstox. Pine's
-        // EMA20 is calculated from a much longer chart history than 5 days;
-        // using one month materially reduces warm-up drift and improves parity.
+        // One month gives EMA20 enough warm-up history to closely match TradingView.
         const fromDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
         const raw = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', getTodayDateIST(), fromDate);
         const candles = raw.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
@@ -71,7 +69,10 @@ export async function GET() {
         const sessionCandles = candles.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
         if (!previousDayCandles.length || !sessionCandles.length) return { ok: false as const };
 
-        let latestRelevant: ReturnType<typeof runPrimeScan> | null = null;
+        // Do not overwrite a strong early Pine signal with a weaker later state.
+        // This is important for cases such as a 09:15 PRIME BUY followed by a
+        // 09:40/09:45 SETUP. The dashboard should still show the confirmed BUY.
+        let bestSignal: ReturnType<typeof runPrimeScan> | null = null;
         for (const candle of sessionCandles) {
           const before = candles.filter(c => new Date(c.timestamp).getTime() < new Date(candle.timestamp).getTime());
           if (before.length < 20) continue;
@@ -87,9 +88,12 @@ export async function GET() {
             previousDayCandles,
           };
           const result = runPrimeScan(input);
-          if (result.state !== 'NO_TRADE') latestRelevant = result;
+          if (result.state === 'NO_TRADE') continue;
+          if (!bestSignal || signalPriority(result.state) > signalPriority(bestSignal.state) || (signalPriority(result.state) === signalPriority(bestSignal.state) && new Date(result.candle.timestamp).getTime() > new Date(bestSignal.candle.timestamp).getTime())) {
+            bestSignal = result;
+          }
         }
-        return { ok: true as const, result: latestRelevant };
+        return { ok: true as const, result: bestSignal };
       } catch (error) {
         console.error(`Scan failed for ${instrument.symbol}:`, error);
         return { ok: false as const };
