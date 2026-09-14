@@ -20,13 +20,22 @@ function isPrimeWindow(timestamp: string) {
   return m >= 9 * 60 + 15 && m < 10 * 60;
 }
 
+function isNseMarketWindowNow() {
+  const now = new Date();
+  const weekday = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Kolkata', weekday: 'short' }).formatToParts(now).find(p => p.type === 'weekday')?.value === 'Sun' ? 0 : 1);
+  const day = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Kolkata', weekday: 'short' }).format(now);
+  if (day === 'Sat' || day === 'Sun') return false;
+  const minutes = istMinutes(now.toISOString());
+  return minutes >= 9 * 60 + 15 && minutes <= 15 * 60 + 30;
+}
+
 function signalPriority(state: ReturnType<typeof runPrimeScan>['state']) {
   return state === 'CONFIRMED' ? 4 : state === 'FAKE_BREAKOUT' ? 3 : state === 'SETUP' ? 2 : state === 'WATCH' ? 1 : 0;
 }
 
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-/** Start one stock every 42ms (~47.6 requests/sec when each stock uses two parallel calls). */
+/** Start one stock every 42ms (~23.8 stocks/sec; two calls per stock stay below ~50 req/sec). */
 async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>) {
   let nextIndex = 0;
   let nextStartAt = Date.now();
@@ -94,7 +103,10 @@ async function executeScan(): Promise<ScanPayload> {
   const quoteByToken = new Map<string, (typeof quotes)[string]>();
   for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-  const fromDate = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  // Keep enough calendar history to always include at least two completed NSE
+  // sessions. Three calendar days can contain only one session around weekends.
+  const fromDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const useIntraday = isNseMarketWindowNow();
   const results: ReturnType<typeof runPrimeScan>[] = [];
   let failedCount = 0;
 
@@ -103,36 +115,36 @@ async function executeScan(): Promise<ScanPayload> {
     if (!quote?.last_price) { failedCount += 1; return; }
 
     try {
-      const [historicalResult, intradayResult] = await Promise.allSettled([
-        upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', today, fromDate),
-        upstoxService.getIntradayCandles(instrument.instrumentKey, '5'),
-      ]);
-
-      const historical = historicalResult.status === 'fulfilled' ? historicalResult.value : [];
-      const intraday = intradayResult.status === 'fulfilled' ? intradayResult.value : [];
+      // Outside market hours we do NOT call intraday for every stock. Historical
+      // V3 is the correct source for the last completed session and avoids the
+      // previous 210-stock "unavailable" failure when intraday returns empty.
+      const historical = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', today, fromDate);
       const historicalSorted = historical.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-      const intradaySorted = intraday.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-      // Do NOT mark the stock unavailable merely because one of the two endpoints
-      // returned no candles. V3 intraday is current-day data; historical is the
-      // warm-up/previous-session source. Either can be temporarily empty.
       const historicalDates = [...new Set(historicalSorted.map(c => istDate(c.timestamp)))].sort();
-      const intradayToday = intradaySorted.filter(c => istDate(c.timestamp) === today && isPrimeWindow(c.timestamp));
 
-      let latestDate: string;
-      let sessionCandles: typeof historicalSorted;
+      let latestDate = '';
+      let sessionCandles: typeof historicalSorted = [];
       let previousDate: string | undefined;
-      let previousDayCandles: typeof historicalSorted;
+      let previousDayCandles: typeof historicalSorted = [];
 
-      if (intradayToday.length > 0) {
-        // Preferred: today's actual 5-minute candles from V3 intraday.
-        latestDate = today;
-        sessionCandles = intradayToday;
-        previousDate = historicalDates.filter(date => date < today).at(-1);
-        previousDayCandles = previousDate ? historicalSorted.filter(c => istDate(c.timestamp) === previousDate) : [];
-      } else {
-        // After-market fallback: if current-day intraday is unavailable, use the
-        // latest completed trading session returned by Historical V3.
+      if (useIntraday) {
+        const intraday = await upstoxService.getIntradayCandles(instrument.instrumentKey, '5');
+        const intradayToday = intraday
+          .slice()
+          .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+          .filter(c => istDate(c.timestamp) === today && isPrimeWindow(c.timestamp));
+
+        if (intradayToday.length > 0) {
+          latestDate = today;
+          sessionCandles = intradayToday;
+          previousDate = historicalDates.filter(date => date < today).at(-1);
+          previousDayCandles = previousDate ? historicalSorted.filter(c => istDate(c.timestamp) === previousDate) : [];
+        }
+      }
+
+      // Reliable fallback for market-closed periods and for any instrument whose
+      // current-day intraday feed is temporarily empty.
+      if (!latestDate) {
         latestDate = historicalDates.at(-1) || '';
         sessionCandles = historicalSorted.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
         previousDate = historicalDates.filter(date => date < latestDate).at(-1);
@@ -144,8 +156,6 @@ async function executeScan(): Promise<ScanPayload> {
         return;
       }
 
-      // Need enough historical warm-up for EMA/volume/SMA calculations. If today's
-      // intraday source is used, historical data supplies the complete warm-up.
       const warmup = historicalSorted.filter(c => istDate(c.timestamp) < latestDate);
       if (warmup.length < 20) { failedCount += 1; return; }
       const workingCandles = [...warmup, ...sessionCandles].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
@@ -192,7 +202,7 @@ async function executeScan(): Promise<ScanPayload> {
     marketStatus,
     results: rankedResults,
     generatedAt: new Date().toISOString(),
-    source: 'upstox-analytics-token + NSE_EQ historical warm-up + NSE_EQ intraday 5m + PRIME TECHNICAL v3 FAST PRIME',
+    source: 'upstox-analytics-token + NSE_EQ historical warm-up + NSE_EQ intraday 5m when market is open + PRIME TECHNICAL v3 FAST PRIME',
     timeframe: '5minute',
     scanWindow: '09:15-10:00 IST',
     asOfDate: sessionDatesFromResults(rankedResults) || today,
