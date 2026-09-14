@@ -26,15 +26,11 @@ function signalPriority(state: ReturnType<typeof runPrimeScan>['state']) {
 
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-/**
- * Each stock now starts two Upstox candle calls (historical + current-day intraday)
- * in parallel. Start a worker every 42ms so the pair stays under ~50 requests/sec.
- */
+/** Start one stock every 42ms (~47.6 requests/sec when each stock uses two parallel calls). */
 async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>) {
   let nextIndex = 0;
   let nextStartAt = Date.now();
   const startLock: { promise: Promise<void> } = { promise: Promise.resolve() };
-
   const acquireStartSlot = async () => {
     let release!: () => void;
     const previous = startLock.promise;
@@ -46,7 +42,6 @@ async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>)
     release();
     if (startAt > now) await sleep(startAt - now);
   };
-
   const runner = async () => {
     while (true) {
       const index = nextIndex++;
@@ -55,24 +50,11 @@ async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>)
       await worker(items[index]);
     }
   };
-
   await Promise.all(Array.from({ length: Math.min(100, items.length) }, () => runner()));
 }
 
 type ScanPayload = {
-  summary: {
-    universeCount: number;
-    availableCount: number;
-    scannedCount: number;
-    failedCount: number;
-    buyCount: number;
-    sellCount: number;
-    setupCount: number;
-    confirmedCount: number;
-    watchCount: number;
-    fakeBreakoutCount: number;
-    noTradeCount: number;
-  };
+  summary: { universeCount: number; availableCount: number; scannedCount: number; failedCount: number; buyCount: number; sellCount: number; setupCount: number; confirmedCount: number; watchCount: number; fakeBreakoutCount: number; noTradeCount: number };
   marketStatus: ReturnType<typeof getMarketStatus>;
   results: ReturnType<typeof runPrimeScan>[];
   generatedAt: string;
@@ -87,7 +69,6 @@ let inFlightScan: Promise<ScanPayload> | null = null;
 
 function cacheIsFresh(cache: NonNullable<typeof cachedScan>, now: number) {
   const minutes = istMinutes(new Date(now).toISOString());
-  // After the 09:15-10:00 signal window closes, the day's signal set is immutable.
   if (minutes >= 10 * 60) return true;
   return now - cache.createdAt < 60_000;
 }
@@ -113,8 +94,6 @@ async function executeScan(): Promise<ScanPayload> {
   const quoteByToken = new Map<string, (typeof quotes)[string]>();
   for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-  // Three calendar days is enough to capture the previous NSE trading session while
-  // keeping the historical response small. Current-day candles come from V3 intraday.
   const fromDate = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const results: ReturnType<typeof runPrimeScan>[] = [];
   let failedCount = 0;
@@ -133,26 +112,42 @@ async function executeScan(): Promise<ScanPayload> {
       const intraday = intradayResult.status === 'fulfilled' ? intradayResult.value : [];
       const historicalSorted = historical.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
       const intradaySorted = intraday.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-      if (historicalSorted.length < 30) { failedCount += 1; return; }
 
+      // Do NOT mark the stock unavailable merely because one of the two endpoints
+      // returned no candles. V3 intraday is current-day data; historical is the
+      // warm-up/previous-session source. Either can be temporarily empty.
       const historicalDates = [...new Set(historicalSorted.map(c => istDate(c.timestamp)))].sort();
-      if (historicalDates.length < 1) { failedCount += 1; return; }
-
       const intradayToday = intradaySorted.filter(c => istDate(c.timestamp) === today && isPrimeWindow(c.timestamp));
-      const useCurrentDay = intradayToday.length > 0;
-      const latestDate = useCurrentDay ? today : historicalDates[historicalDates.length - 1];
-      const priorDates = historicalDates.filter(date => date < latestDate);
-      const previousDate = priorDates.at(-1);
-      const previousDayCandles = previousDate ? historicalSorted.filter(c => istDate(c.timestamp) === previousDate) : [];
-      const sessionCandles = useCurrentDay
-        ? intradayToday
-        : historicalSorted.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
 
-      if (!previousDayCandles.length || !sessionCandles.length) { failedCount += 1; return; }
+      let latestDate: string;
+      let sessionCandles: typeof historicalSorted;
+      let previousDate: string | undefined;
+      let previousDayCandles: typeof historicalSorted;
 
-      // Build one chronological series: historical warm-up + selected signal session.
-      // This prevents the old 11/09 session from being silently used when 14/09 data exists.
+      if (intradayToday.length > 0) {
+        // Preferred: today's actual 5-minute candles from V3 intraday.
+        latestDate = today;
+        sessionCandles = intradayToday;
+        previousDate = historicalDates.filter(date => date < today).at(-1);
+        previousDayCandles = previousDate ? historicalSorted.filter(c => istDate(c.timestamp) === previousDate) : [];
+      } else {
+        // After-market fallback: if current-day intraday is unavailable, use the
+        // latest completed trading session returned by Historical V3.
+        latestDate = historicalDates.at(-1) || '';
+        sessionCandles = historicalSorted.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
+        previousDate = historicalDates.filter(date => date < latestDate).at(-1);
+        previousDayCandles = previousDate ? historicalSorted.filter(c => istDate(c.timestamp) === previousDate) : [];
+      }
+
+      if (!latestDate || !sessionCandles.length || !previousDayCandles.length) {
+        failedCount += 1;
+        return;
+      }
+
+      // Need enough historical warm-up for EMA/volume/SMA calculations. If today's
+      // intraday source is used, historical data supplies the complete warm-up.
       const warmup = historicalSorted.filter(c => istDate(c.timestamp) < latestDate);
+      if (warmup.length < 20) { failedCount += 1; return; }
       const workingCandles = [...warmup, ...sessionCandles].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
       let bestSignal: ReturnType<typeof runPrimeScan> | null = null;
@@ -208,17 +203,10 @@ export async function GET() {
   try {
     const today = getTodayDateIST();
     const now = Date.now();
-    const cacheKey = today;
-
-    if (cachedScan && cachedScan.key === cacheKey && cacheIsFresh(cachedScan, now)) {
-      return NextResponse.json({ status: 'success', data: cachedScan.data });
-    }
-
-    // A second click while the first scan is running now shares the same server scan.
-    // Browser-side aborts therefore cannot start a second 200+ request storm.
+    if (cachedScan && cachedScan.key === today && cacheIsFresh(cachedScan, now)) return NextResponse.json({ status: 'success', data: cachedScan.data });
     if (!inFlightScan) inFlightScan = executeScan();
     const data = await inFlightScan;
-    cachedScan = { key: cacheKey, createdAt: Date.now(), data };
+    cachedScan = { key: today, createdAt: Date.now(), data };
     return NextResponse.json({ status: 'success', data });
   } catch (error) {
     console.error('Prime scan error:', error);
