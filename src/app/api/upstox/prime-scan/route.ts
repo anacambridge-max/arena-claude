@@ -4,7 +4,8 @@ import { getMarketStatus, getTodayDateIST } from '@/lib/market-utils';
 import { runPrimeScan, rankScanResults, type ScannerInput } from '@/engine/prime/scanner';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 60;
+// Keep a generous platform ceiling; the rate-limited scanner normally completes much sooner.
+export const maxDuration = 300;
 
 function istDate(timestamp: string) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(timestamp));
@@ -29,9 +30,10 @@ function sleep(ms: number) {
 }
 
 /**
- * Run the full universe without the old "wait for the whole batch" bottleneck.
- * Upstox allows 50 standard API requests/sec, so starts are spaced at ~45/sec
- * while at most 50 historical requests are in flight at once.
+ * Full-universe scanner: all F&O stocks are retained. Requests are started
+ * about 43.5/sec, safely below the 50/sec standard API limit, with up to
+ * 50 historical requests in flight. This removes the old 40-at-a-time
+ * batch barrier that made each slow request hold up the next batch.
  */
 async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>) {
   let nextIndex = 0;
@@ -87,8 +89,7 @@ export async function GET() {
     const quoteByToken = new Map<string, (typeof quotes)[string]>();
     for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-    // Five calendar days is enough to include the previous trading session and
-    // plenty of warm-up candles. The scan only consumes the previous session + 09:15-10:00.
+    // Five calendar days gives enough warm-up for EMA20/volume SMA20/range SMA10.
     const fromDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
     const results: ReturnType<typeof runPrimeScan>[] = [];
