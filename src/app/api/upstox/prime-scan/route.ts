@@ -33,8 +33,12 @@ function signalPriority(state: ReturnType<typeof runPrimeScan>['state']) {
 
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-/** Start one stock every 42ms (~23.8 stocks/sec; two calls per stock stay below ~50 req/sec). */
-async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>) {
+/**
+ * Keep Upstox below its 50 req/sec standard API limit. During market hours
+ * each stock can use historical + intraday, so start one every 42ms. Outside
+ * market hours we only need historical, so one every 22ms is safe and faster.
+ */
+async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>, intervalMs: number) {
   let nextIndex = 0;
   let nextStartAt = Date.now();
   const startLock: { promise: Promise<void> } = { promise: Promise.resolve() };
@@ -45,7 +49,7 @@ async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>)
     await previous;
     const now = Date.now();
     const startAt = Math.max(now, nextStartAt);
-    nextStartAt = startAt + 42;
+    nextStartAt = startAt + intervalMs;
     release();
     if (startAt > now) await sleep(startAt - now);
   };
@@ -101,8 +105,6 @@ async function executeScan(): Promise<ScanPayload> {
   const quoteByToken = new Map<string, (typeof quotes)[string]>();
   for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-  // Ten calendar days guarantees enough history for the previous NSE session,
-  // including weekends and exchange holidays.
   const fromDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const useIntraday = isNseMarketWindowNow();
   const results: ReturnType<typeof runPrimeScan>[] = [];
@@ -113,9 +115,6 @@ async function executeScan(): Promise<ScanPayload> {
     if (!quote?.last_price) { failedCount += 1; return; }
 
     try {
-      // Historical V3 is always fetched. During market hours, current-day V3
-      // intraday candles are preferred. Outside market hours we skip 210 empty
-      // intraday calls and scan the latest completed session from history.
       const historical = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', today, fromDate);
       const historicalSorted = historical.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
       const historicalDates = [...new Set(historicalSorted.map(c => istDate(c.timestamp)))].sort();
@@ -140,8 +139,9 @@ async function executeScan(): Promise<ScanPayload> {
         }
       }
 
-      // Reliable fallback for market-closed periods and for any instrument whose
-      // current-day intraday feed is temporarily empty.
+      // Market closed (or an unavailable intraday feed): use the latest
+      // completed NSE session returned by Historical V3. This is what keeps
+      // the dashboard populated after 15:30 instead of showing 0/210.
       if (!latestDate) {
         latestDate = historicalDates.at(-1) || '';
         sessionCandles = historicalSorted.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
@@ -185,7 +185,9 @@ async function executeScan(): Promise<ScanPayload> {
     }
   };
 
-  await runRateLimited(instruments, scanOne);
+  // Closed-market scan: one API call per stock, so we can safely run close to
+  // the 50 req/sec Upstox limit. Open-market scan: two calls per stock.
+  await runRateLimited(instruments, scanOne, useIntraday ? 42 : 22);
 
   const rankedResults = rankScanResults(results);
   const buyCount = rankedResults.filter(r => r.state === 'CONFIRMED' && r.direction === 'BULLISH').length;
