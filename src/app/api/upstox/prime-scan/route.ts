@@ -21,11 +21,9 @@ function isPrimeWindow(timestamp: string) {
 }
 
 function isNseMarketWindowNow() {
-  const now = new Date();
-  const weekday = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Kolkata', weekday: 'short' }).formatToParts(now).find(p => p.type === 'weekday')?.value === 'Sun' ? 0 : 1);
-  const day = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Kolkata', weekday: 'short' }).format(now);
+  const day = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Kolkata', weekday: 'short' }).format(new Date());
   if (day === 'Sat' || day === 'Sun') return false;
-  const minutes = istMinutes(now.toISOString());
+  const minutes = istMinutes(new Date().toISOString());
   return minutes >= 9 * 60 + 15 && minutes <= 15 * 60 + 30;
 }
 
@@ -103,8 +101,8 @@ async function executeScan(): Promise<ScanPayload> {
   const quoteByToken = new Map<string, (typeof quotes)[string]>();
   for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-  // Keep enough calendar history to always include at least two completed NSE
-  // sessions. Three calendar days can contain only one session around weekends.
+  // Ten calendar days guarantees enough history for the previous NSE session,
+  // including weekends and exchange holidays.
   const fromDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const useIntraday = isNseMarketWindowNow();
   const results: ReturnType<typeof runPrimeScan>[] = [];
@@ -115,9 +113,9 @@ async function executeScan(): Promise<ScanPayload> {
     if (!quote?.last_price) { failedCount += 1; return; }
 
     try {
-      // Outside market hours we do NOT call intraday for every stock. Historical
-      // V3 is the correct source for the last completed session and avoids the
-      // previous 210-stock "unavailable" failure when intraday returns empty.
+      // Historical V3 is always fetched. During market hours, current-day V3
+      // intraday candles are preferred. Outside market hours we skip 210 empty
+      // intraday calls and scan the latest completed session from history.
       const historical = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', today, fromDate);
       const historicalSorted = historical.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
       const historicalDates = [...new Set(historicalSorted.map(c => istDate(c.timestamp)))].sort();
