@@ -35,6 +35,11 @@ export class UpstoxService {
   isAuthenticated(): boolean { return this.isConfigured(); }
   private authHeaders() { if (!this.analyticsToken) throw new Error('UPSTOX_ANALYTICS_TOKEN is not configured'); return { Authorization: `Bearer ${this.analyticsToken}`, Accept: 'application/json', 'Content-Type': 'application/json' }; }
 
+  private mapCandleResponse(response: { data: UpstoxHistoricalCandleResponse }): Candle[] {
+    if (response.data.status !== 'success') return [];
+    return (response.data.data?.candles || []).map(candle => ({ timestamp: candle[0], open: candle[1], high: candle[2], low: candle[3], close: candle[4], volume: candle[5] }));
+  }
+
   async getHistoricalCandles(instrumentKey: string, interval: '1minute' | '5minute' | '30minute' | 'day' | 'week' | 'month', toDate: string, fromDate?: string): Promise<Candle[]> {
     const minuteInterval = interval === '1minute' ? '1' : interval === '5minute' ? '5' : interval === '30minute' ? '30' : null;
     const path = minuteInterval
@@ -42,12 +47,23 @@ export class UpstoxService {
       : (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}`);
     try {
       const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, { headers: this.authHeaders(), timeout: 6000 });
-      if (response.data.status !== 'success') return [];
-      return (response.data.data?.candles || []).map(candle => ({ timestamp: candle[0], open: candle[1], high: candle[2], low: candle[3], close: candle[4], volume: candle[5] }));
+      return this.mapCandleResponse(response);
     } catch (error) {
       const status = axios.isAxiosError(error) ? error.response?.status : undefined;
       const apiMessage = axios.isAxiosError(error) ? error.response?.data?.errors?.[0]?.message || error.response?.data?.message : undefined;
       throw new Error(`Historical candle request failed${status ? ` (${status})` : ''}${apiMessage ? `: ${apiMessage}` : ''}`);
+    }
+  }
+
+  /** Current trading-day candles. Upstox V3 supports 5-minute intraday candles. */
+  async getIntradayCandles(instrumentKey: string, interval: '1' | '5' | '30' = '5'): Promise<Candle[]> {
+    try {
+      const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}/historical-candle/intraday/${encodeURIComponent(instrumentKey)}/minutes/${interval}`, { headers: this.authHeaders(), timeout: 6000 });
+      return this.mapCandleResponse(response);
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      const apiMessage = axios.isAxiosError(error) ? error.response?.data?.errors?.[0]?.message || error.response?.data?.message : undefined;
+      throw new Error(`Intraday candle request failed${status ? ` (${status})` : ''}${apiMessage ? `: ${apiMessage}` : ''}`);
     }
   }
 
