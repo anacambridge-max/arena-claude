@@ -24,6 +24,44 @@ function signalPriority(state: ReturnType<typeof runPrimeScan>['state']) {
   return state === 'CONFIRMED' ? 4 : state === 'FAKE_BREAKOUT' ? 3 : state === 'SETUP' ? 2 : state === 'WATCH' ? 1 : 0;
 }
 
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Run the full universe without the old "wait for the whole batch" bottleneck.
+ * Upstox allows 50 standard API requests/sec, so starts are spaced at ~45/sec
+ * while at most 50 historical requests are in flight at once.
+ */
+async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>) {
+  let nextIndex = 0;
+  let nextStartAt = Date.now();
+  const startLock: { promise: Promise<void> } = { promise: Promise.resolve() };
+
+  const acquireStartSlot = async () => {
+    let release!: () => void;
+    const previous = startLock.promise;
+    startLock.promise = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    const now = Date.now();
+    const startAt = Math.max(now, nextStartAt);
+    nextStartAt = startAt + 23;
+    release();
+    if (startAt > now) await sleep(startAt - now);
+  };
+
+  const runner = async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      await acquireStartSlot();
+      await worker(items[index]);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(50, items.length) }, () => runner()));
+}
+
 export async function GET() {
   try {
     if (!upstoxService.isAuthenticated()) {
@@ -49,28 +87,45 @@ export async function GET() {
     const quoteByToken = new Map<string, (typeof quotes)[string]>();
     for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-    // Five trading days is enough warm-up for EMA20, volume SMA20 and range SMA10.
+    // Five calendar days is enough to include the previous trading session and
+    // plenty of warm-up candles. The scan only consumes the previous session + 09:15-10:00.
     const fromDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    const results: ReturnType<typeof runPrimeScan>[] = [];
+    let failedCount = 0;
 
     const scanOne = async (instrument: (typeof instruments)[number]) => {
       const quote = quoteByToken.get(instrument.instrumentKey) ?? quotes[instrument.instrumentKey];
-      if (!quote?.last_price) return { ok: false as const };
+      if (!quote?.last_price) {
+        failedCount += 1;
+        return;
+      }
       try {
         const raw = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', getTodayDateIST(), fromDate);
         const candles = raw.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-        if (candles.length < 30) return { ok: false as const };
+        if (candles.length < 30) {
+          failedCount += 1;
+          return;
+        }
 
         const sessionDates = [...new Set(candles.map(c => istDate(c.timestamp)))].sort();
-        if (sessionDates.length < 2) return { ok: false as const };
+        if (sessionDates.length < 2) {
+          failedCount += 1;
+          return;
+        }
         const latestDate = sessionDates[sessionDates.length - 1];
         const previousDate = sessionDates[sessionDates.length - 2];
         const previousDayCandles = candles.filter(c => istDate(c.timestamp) === previousDate);
         const sessionCandles = candles.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
-        if (!previousDayCandles.length || !sessionCandles.length) return { ok: false as const };
+        if (!previousDayCandles.length || !sessionCandles.length) {
+          failedCount += 1;
+          return;
+        }
 
         let bestSignal: ReturnType<typeof runPrimeScan> | null = null;
         for (const candle of sessionCandles) {
-          const before = candles.filter(c => new Date(c.timestamp).getTime() < new Date(candle.timestamp).getTime());
+          const candleTime = new Date(candle.timestamp).getTime();
+          const before = candles.filter(c => new Date(c.timestamp).getTime() < candleTime);
           if (before.length < 20) continue;
           const input: ScannerInput = {
             symbol: instrument.symbol,
@@ -87,25 +142,14 @@ export async function GET() {
           if (result.state === 'NO_TRADE' || !result.candle) continue;
           if (!bestSignal || signalPriority(result.state) > signalPriority(bestSignal.state) || (signalPriority(result.state) === signalPriority(bestSignal.state) && new Date(result.candle.timestamp).getTime() > new Date(bestSignal.candle!.timestamp).getTime())) bestSignal = result;
         }
-        return { ok: true as const, result: bestSignal };
+        if (bestSignal) results.push(bestSignal);
       } catch (error) {
+        failedCount += 1;
         console.error(`Scan failed for ${instrument.symbol}:`, error);
-        return { ok: false as const };
       }
     };
 
-    // Upstox currently limits standard APIs, including historical candles, to 50 requests/sec.
-    // 40 concurrent requests keeps a safety margin and prevents 429s/connection overloads.
-    const concurrency = 40;
-    const results: ReturnType<typeof runPrimeScan>[] = [];
-    let failedCount = 0;
-    for (let i = 0; i < instruments.length; i += concurrency) {
-      const batch = await Promise.all(instruments.slice(i, i + concurrency).map(scanOne));
-      for (const item of batch) {
-        if (!item.ok) failedCount += 1;
-        else if (item.result) results.push(item.result);
-      }
-    }
+    await runRateLimited(instruments, scanOne);
 
     const rankedResults = rankScanResults(results);
     const buyCount = rankedResults.filter(r => r.state === 'CONFIRMED' && r.direction === 'BULLISH').length;
