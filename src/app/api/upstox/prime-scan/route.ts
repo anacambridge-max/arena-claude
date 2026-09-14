@@ -29,10 +29,9 @@ function signalPriority(state: ReturnType<typeof runPrimeScan>['state']) {
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 /**
- * Global Upstox request scheduler. Standard APIs are limited to 50 req/sec.
- * Many stock workers can remain active, while actual HTTP requests are started
- * at 20ms intervals. This lets historical and intraday calls overlap instead
- * of making every stock wait for its historical request first.
+ * Upstox documents standard API limits per API. Keep an independent 50 req/sec
+ * lane for historical and intraday candles. This is materially faster than a
+ * single shared lane while remaining inside the documented per-API limit.
  */
 class UpstoxRequestLimiter {
   private nextStartAt = Date.now();
@@ -58,8 +57,8 @@ type CandleCacheEntry = {
 };
 
 // Historical candles are immutable for the requested completed-session range.
-// Keeping them on the warm Vercel instance makes subsequent scans dramatically
-// faster, especially during the 09:15-10:00 scan window.
+// Keep them on the warm Vercel instance so repeat scans don't redownload 210
+// histories. This does not alter the Pine calculation at all.
 const historicalCache = new Map<string, CandleCacheEntry>();
 
 async function getCachedHistorical(instrumentKey: string, toDate: string, fromDate: string, limiter: UpstoxRequestLimiter) {
@@ -107,25 +106,22 @@ async function executeScan(): Promise<ScanPayload> {
   const quoteByToken = new Map<string, (typeof quotes)[string]>();
   for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-  // PRIME only needs the previous completed session plus 20+ warm-up candles.
-  // Four calendar days covers a normal weekend and short holiday gap.
   const fromDate = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const useIntraday = isNseMarketWindowNow();
-  const limiter = new UpstoxRequestLimiter();
+  // Historical and intraday are independent Upstox API lanes. Running them in
+  // parallel cuts the first open-market scan roughly in half.
+  const historicalLimiter = new UpstoxRequestLimiter();
+  const intradayLimiter = new UpstoxRequestLimiter();
   const results: ReturnType<typeof runPrimeScan>[] = [];
   let failedCount = 0;
 
-  // Keep all 210 stocks active. The request limiter controls Upstox traffic;
-  // workers themselves no longer serialize historical -> intraday per stock.
   await Promise.all(instruments.map(async instrument => {
     const quote = quoteByToken.get(instrument.instrumentKey) ?? quotes[instrument.instrumentKey];
     if (!quote?.last_price) { failedCount += 1; return; }
     try {
-      // These are independently rate-limited, so open-market scans overlap the
-      // two network calls instead of waiting for historical data first.
-      const historicalPromise = getCachedHistorical(instrument.instrumentKey, today, fromDate, limiter);
+      const historicalPromise = getCachedHistorical(instrument.instrumentKey, today, fromDate, historicalLimiter);
       const intradayPromise = useIntraday
-        ? limiter.run(() => upstoxService.getIntradayCandles(instrument.instrumentKey, '5'))
+        ? intradayLimiter.run(() => upstoxService.getIntradayCandles(instrument.instrumentKey, '5'))
         : Promise.resolve(null);
       const [historical, intraday] = await Promise.all([historicalPromise, intradayPromise]);
 
@@ -146,8 +142,6 @@ async function executeScan(): Promise<ScanPayload> {
         }
       }
 
-      // Closed market OR empty current-day intraday: use the latest completed
-      // session from Historical Candle V3.
       if (!latestDate) {
         latestDate = historicalDates.at(-1) || '';
         sessionCandles = historicalSorted.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
