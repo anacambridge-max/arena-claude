@@ -27,13 +27,30 @@ export async function GET() {
     }
 
     const marketStatus = getMarketStatus();
+
+    // F&O futures define the eligible stock universe and preserve lot size,
+    // but ALL Pine calculations must run on the underlying NSE cash/equity
+    // chart. This is what makes the scanner comparable with TradingView's
+    // NSE:SYMBOL 5-minute chart.
     const futures = await upstoxService.getAllNSEFuturesInstruments();
-    const instruments = Object.values(futures).map(future => ({
-      symbol: future.underlying_symbol.toUpperCase(), instrumentKey: future.instrument_key, lotSize: future.lot_size || 1,
-    }));
+    const symbols = Object.keys(futures);
+    const equities = await upstoxService.getNSEEquityInstruments(symbols);
+    const instruments = symbols
+      .map(symbol => {
+        const future = futures[symbol];
+        const equity = equities[symbol];
+        if (!equity) return null;
+        return {
+          symbol,
+          instrumentKey: equity.instrument_key,
+          lotSize: future.lot_size || 1,
+          futuresInstrumentKey: future.instrument_key,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item));
 
     if (!instruments.length) {
-      return NextResponse.json({ status: 'error', error: 'No active NSE F&O stock futures found in Upstox instrument master.', message: 'Upstox returned an empty F&O stock universe.' }, { status: 503 });
+      return NextResponse.json({ status: 'error', error: 'No NSE equity instruments matched the active F&O stock universe.', message: 'Upstox returned no underlying NSE cash instruments for the F&O universe.' }, { status: 503 });
     }
 
     const quotes = await upstoxService.getMarketQuotes(instruments.map(i => i.instrumentKey));
@@ -44,9 +61,8 @@ export async function GET() {
       const quote = quoteByToken.get(instrument.instrumentKey) ?? quotes[instrument.instrumentKey];
       if (!quote?.last_price) return { ok: false as const };
       try {
-        // Five trading-minute bars need only a small recent window. Keeping this
-        // at five calendar days materially reduces the response payload and scan time.
         const fromDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        // IMPORTANT: use NSE_EQ key, not the futures key, for exact Pine parity.
         const raw = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', getTodayDateIST(), fromDate);
         const candles = raw.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
         if (candles.length < 30) return { ok: false as const };
@@ -64,10 +80,15 @@ export async function GET() {
           const before = candles.filter(c => new Date(c.timestamp).getTime() < new Date(candle.timestamp).getTime());
           if (before.length < 20) continue;
           const input: ScannerInput = {
-            symbol: instrument.symbol, instrumentKey: instrument.instrumentKey, exchange: 'NSE_FO', lotSize: instrument.lotSize,
+            symbol: instrument.symbol,
+            instrumentKey: instrument.instrumentKey,
+            exchange: 'NSE_EQ',
+            lotSize: instrument.lotSize,
             ltp: quote.last_price,
             dayChangePercent: quote.net_change && quote.ohlc?.close ? (quote.net_change / quote.ohlc.close) * 100 : 0,
-            currentCandle: candle, historicalCandles: [...before, candle], previousDayCandles,
+            currentCandle: candle,
+            historicalCandles: [...before, candle],
+            previousDayCandles,
           };
           const result = runPrimeScan(input);
           if (result.state !== 'NO_TRADE') latestRelevant = result;
@@ -79,8 +100,6 @@ export async function GET() {
       }
     };
 
-    // Run many independent Upstox candle requests concurrently. The previous
-    // 25-at-a-time loop serialized many batches and could hit Vercel timeouts.
     const concurrency = 100;
     const results: ReturnType<typeof runPrimeScan>[] = [];
     let failedCount = 0;
@@ -104,11 +123,24 @@ export async function GET() {
       status: 'success',
       data: {
         summary: {
-          universeCount: instruments.length, availableCount: instruments.length - failedCount, scannedCount: instruments.length - failedCount,
-          failedCount, buyCount, sellCount, setupCount, confirmedCount: buyCount + sellCount, watchCount, fakeBreakoutCount, noTradeCount,
+          universeCount: instruments.length,
+          availableCount: instruments.length - failedCount,
+          scannedCount: instruments.length - failedCount,
+          failedCount,
+          buyCount,
+          sellCount,
+          setupCount,
+          confirmedCount: buyCount + sellCount,
+          watchCount,
+          fakeBreakoutCount,
+          noTradeCount,
         },
-        marketStatus, results: rankedResults, generatedAt: new Date().toISOString(),
-        source: 'upstox-analytics-token + PRIME TECHNICAL v3 FAST PRIME', timeframe: '5minute', scanWindow: '09:15-10:00 IST',
+        marketStatus,
+        results: rankedResults,
+        generatedAt: new Date().toISOString(),
+        source: 'upstox-analytics-token + NSE_EQ candles + PRIME TECHNICAL v3 FAST PRIME',
+        timeframe: '5minute',
+        scanWindow: '09:15-10:00 IST',
         asOfDate: sessionDatesFromResults(rankedResults) || getTodayDateIST(),
       },
     });
