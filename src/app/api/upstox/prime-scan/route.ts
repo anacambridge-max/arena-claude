@@ -9,32 +9,31 @@ export const maxDuration = 300;
 function istDate(timestamp: string) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(timestamp));
 }
-
 function istMinutes(timestamp: string) {
   const parts = new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(new Date(timestamp));
   return Number(parts.find(p => p.type === 'hour')?.value || 0) * 60 + Number(parts.find(p => p.type === 'minute')?.value || 0);
 }
-
 function isPrimeWindow(timestamp: string) {
   const m = istMinutes(timestamp);
-  return m >= 9 * 60 + 15 && m < 10 * 60;
+  return m >= 555 && m < 600;
 }
-
 function isNseMarketWindowNow() {
   const day = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Kolkata', weekday: 'short' }).format(new Date());
   if (day === 'Sat' || day === 'Sun') return false;
   const minutes = istMinutes(new Date().toISOString());
-  return minutes >= 9 * 60 + 15 && minutes <= 15 * 60 + 30;
+  return minutes >= 555 && minutes <= 930;
 }
-
 function signalPriority(state: ReturnType<typeof runPrimeScan>['state']) {
   return state === 'CONFIRMED' ? 4 : state === 'FAKE_BREAKOUT' ? 3 : state === 'SETUP' ? 2 : state === 'WATCH' ? 1 : 0;
 }
-
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-/** Keep Upstox below 50 req/sec. Closed market = 1 call/stock; open = 2 calls/stock. */
-async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>, intervalMs: number) {
+/**
+ * Keep concurrency high enough for a fast full-universe scan without opening
+ * hundreds of simultaneous sockets. Closed market = one historical request per
+ * stock; open market = historical + intraday, so the start interval changes.
+ */
+async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>, intervalMs: number, concurrency = 50) {
   let nextIndex = 0;
   let nextStartAt = Date.now();
   const startLock: { promise: Promise<void> } = { promise: Promise.resolve() };
@@ -57,7 +56,7 @@ async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>,
       await worker(items[index]);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(100, items.length) }, () => runner()));
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => runner()));
 }
 
 type ScanPayload = {
@@ -70,19 +69,15 @@ type ScanPayload = {
   scanWindow: string;
   asOfDate: string;
 };
-
 let cachedScan: { key: string; createdAt: number; data: ScanPayload } | null = null;
 let inFlightScan: Promise<ScanPayload> | null = null;
-
 function cacheIsFresh(cache: NonNullable<typeof cachedScan>, now: number) {
   const minutes = istMinutes(new Date(now).toISOString());
-  if (minutes >= 10 * 60) return true;
-  return now - cache.createdAt < 60_000;
+  return minutes >= 600 || now - cache.createdAt < 60_000;
 }
 
 async function executeScan(): Promise<ScanPayload> {
   if (!upstoxService.isAuthenticated()) throw new Error('Upstox Analytics Token is not configured');
-
   const marketStatus = getMarketStatus();
   const today = getTodayDateIST();
   const futures = await upstoxService.getAllNSEFuturesInstruments();
@@ -94,15 +89,15 @@ async function executeScan(): Promise<ScanPayload> {
     if (!equity) return null;
     return { symbol, instrumentKey: equity.instrument_key, lotSize: future.lot_size || 1, futuresInstrumentKey: future.instrument_key };
   }).filter((item): item is NonNullable<typeof item> => Boolean(item));
-
   if (!instruments.length) throw new Error('No NSE equity instruments matched the active F&O stock universe.');
 
   const quotes = await upstoxService.getMarketQuotes(instruments.map(i => i.instrumentKey));
   const quoteByToken = new Map<string, (typeof quotes)[string]>();
   for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-  // Five calendar days covers the normal weekend gap plus enough warm-up for EMA20/SMA20.
-  const fromDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  // Only fetch the minimum history needed by PRIME: previous session + warm-up.
+  // Four calendar days covers a normal weekend gap and exchange holiday gap.
+  const fromDate = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const useIntraday = isNseMarketWindowNow();
   const results: ReturnType<typeof runPrimeScan>[] = [];
   let failedCount = 0;
@@ -110,12 +105,10 @@ async function executeScan(): Promise<ScanPayload> {
   const scanOne = async (instrument: (typeof instruments)[number]) => {
     const quote = quoteByToken.get(instrument.instrumentKey) ?? quotes[instrument.instrumentKey];
     if (!quote?.last_price) { failedCount += 1; return; }
-
     try {
       const historical = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', today, fromDate);
       const historicalSorted = historical.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
       const historicalDates = [...new Set(historicalSorted.map(c => istDate(c.timestamp)))].sort();
-
       let latestDate = '';
       let sessionCandles: typeof historicalSorted = [];
       let previousDate: string | undefined;
@@ -123,10 +116,7 @@ async function executeScan(): Promise<ScanPayload> {
 
       if (useIntraday) {
         const intraday = await upstoxService.getIntradayCandles(instrument.instrumentKey, '5');
-        const intradayToday = intraday
-          .slice()
-          .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-          .filter(c => istDate(c.timestamp) === today && isPrimeWindow(c.timestamp));
+        const intradayToday = intraday.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()).filter(c => istDate(c.timestamp) === today && isPrimeWindow(c.timestamp));
         if (intradayToday.length > 0) {
           latestDate = today;
           sessionCandles = intradayToday;
@@ -134,24 +124,16 @@ async function executeScan(): Promise<ScanPayload> {
           previousDayCandles = previousDate ? historicalSorted.filter(c => istDate(c.timestamp) === previousDate) : [];
         }
       }
-
-      // Closed market or missing intraday: scan latest completed session from history.
       if (!latestDate) {
         latestDate = historicalDates.at(-1) || '';
         sessionCandles = historicalSorted.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
         previousDate = historicalDates.filter(date => date < latestDate).at(-1);
         previousDayCandles = previousDate ? historicalSorted.filter(c => istDate(c.timestamp) === previousDate) : [];
       }
-
-      if (!latestDate || !sessionCandles.length || !previousDayCandles.length) {
-        failedCount += 1;
-        return;
-      }
-
+      if (!latestDate || !sessionCandles.length || !previousDayCandles.length) { failedCount += 1; return; }
       const warmup = historicalSorted.filter(c => istDate(c.timestamp) < latestDate);
       if (warmup.length < 20) { failedCount += 1; return; }
       const workingCandles = [...warmup, ...sessionCandles].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
       let bestSignal: ReturnType<typeof runPrimeScan> | null = null;
       for (const candle of sessionCandles) {
         const candleTime = new Date(candle.timestamp).getTime();
@@ -179,7 +161,8 @@ async function executeScan(): Promise<ScanPayload> {
     }
   };
 
-  await runRateLimited(instruments, scanOne, useIntraday ? 42 : 22);
+  // Closed: 50 requests/sec. Open: 2 calls/stock, so 25 requests/sec.
+  await runRateLimited(instruments, scanOne, useIntraday ? 40 : 20, 50);
 
   const rankedResults = rankScanResults(results);
   const buyCount = rankedResults.filter(r => r.state === 'CONFIRMED' && r.direction === 'BULLISH').length;
@@ -188,16 +171,11 @@ async function executeScan(): Promise<ScanPayload> {
   const watchCount = rankedResults.filter(r => r.state === 'WATCH').length;
   const fakeBreakoutCount = rankedResults.filter(r => r.state === 'FAKE_BREAKOUT').length;
   const noTradeCount = Math.max(0, instruments.length - rankedResults.length - failedCount);
-
   return {
     summary: { universeCount: instruments.length, availableCount: instruments.length - failedCount, scannedCount: instruments.length - failedCount, failedCount, buyCount, sellCount, setupCount, confirmedCount: buyCount + sellCount, watchCount, fakeBreakoutCount, noTradeCount },
-    marketStatus,
-    results: rankedResults,
-    generatedAt: new Date().toISOString(),
+    marketStatus, results: rankedResults, generatedAt: new Date().toISOString(),
     source: 'upstox-analytics-token + NSE_EQ historical warm-up + NSE_EQ intraday 5m when market is open + PRIME TECHNICAL v3 FAST PRIME',
-    timeframe: '5minute',
-    scanWindow: '09:15-10:00 IST',
-    asOfDate: sessionDatesFromResults(rankedResults) || today,
+    timeframe: '5minute', scanWindow: '09:15-10:00 IST', asOfDate: sessionDatesFromResults(rankedResults) || today,
   };
 }
 
@@ -214,11 +192,8 @@ export async function GET() {
     console.error('Prime scan error:', error);
     const message = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json({ status: 'error', error: 'Failed to run Prime scan', message }, { status: 500 });
-  } finally {
-    inFlightScan = null;
-  }
+  } finally { inFlightScan = null; }
 }
-
 function sessionDatesFromResults(results: ReturnType<typeof runPrimeScan>[]) {
   const dates = results.map(r => r.candle?.timestamp).filter(Boolean).map(ts => istDate(ts as string));
   return dates.sort().at(-1) || null;
