@@ -11,9 +11,23 @@ import { AlertCircle, Loader2 } from 'lucide-react';
 
 interface ScannerResponse {
   status: string;
-  error?: string;
-  message?: string;
+  error?: unknown;
+  message?: unknown;
   data?: { summary: { universeCount: number; scannedCount: number; failedCount?: number; buyCount: number; sellCount: number; setupCount: number; confirmedCount: number; watchCount: number; fakeBreakoutCount: number; noTradeCount: number }; marketStatus: MarketStatus; results: PrimeScanResult[]; generatedAt: string; asOfDate?: string };
+}
+
+function stringifyError(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim()) return value;
+  if (value instanceof Error && value.message) return value.message;
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    for (const key of ['message', 'error', 'detail', 'description']) {
+      const nested = stringifyError(obj[key]);
+      if (nested) return nested;
+    }
+    try { return JSON.stringify(value); } catch { return null; }
+  }
+  return null;
 }
 
 async function readApiResponse<T>(res: Response): Promise<T> {
@@ -60,11 +74,11 @@ export function DashboardClient() {
   const checkConnection = async () => {
     try {
       const res = await fetch('/api/upstox/status', { cache: 'no-store' });
-      const data = await readApiResponse<{ data?: { connected?: boolean }; message?: string }>(res);
+      const data = await readApiResponse<{ data?: { connected?: boolean }; message?: unknown }>(res);
       const connected = Boolean(data.data?.connected);
       setIsConnected(connected);
-      setError(connected ? null : data.message || 'UPSTOX_ANALYTICS_TOKEN is not configured on the server.');
-    } catch (err) { setIsConnected(false); setError(err instanceof Error ? err.message : 'Unable to check Upstox configuration.'); }
+      setError(connected ? null : stringifyError(data.message) || 'UPSTOX_ANALYTICS_TOKEN is not configured on the server.');
+    } catch (err) { setIsConnected(false); setError(stringifyError(err) || 'Unable to check Upstox configuration.'); }
     finally { setIsLoading(false); }
   };
 
@@ -72,10 +86,10 @@ export function DashboardClient() {
     setIsLoading(true); setError(null);
     try {
       const res = await fetch('/api/upstox/connect', { method: 'POST', cache: 'no-store' });
-      const data = await readApiResponse<{ status: string; message?: string }>(res);
+      const data = await readApiResponse<{ status: string; message?: unknown }>(res);
       if (res.ok && data.status === 'success') { setIsConnected(true); await handleScan(); }
-      else setError(data.message || `Upstox verification failed (HTTP ${res.status}).`);
-    } catch (err) { setError(err instanceof Error ? err.message : 'Failed to verify Upstox configuration.'); }
+      else setError(stringifyError(data.message) || `Upstox verification failed (HTTP ${res.status}).`);
+    } catch (err) { setError(stringifyError(err) || 'Failed to verify Upstox configuration.'); }
     finally { setIsLoading(false); }
   };
 
@@ -84,10 +98,10 @@ export function DashboardClient() {
     try {
       const res = await fetch('/api/upstox/prime-scan', { cache: 'no-store', headers: { Accept: 'application/json' } });
       const data = await readApiResponse<ScannerResponse>(res);
-      if (!res.ok || data.status !== 'success' || !data.data) throw new Error(data.message || data.error || `Failed to run Prime scan (HTTP ${res.status}).`);
+      if (!res.ok || data.status !== 'success' || !data.data) throw new Error(stringifyError(data.message) || stringifyError(data.error) || `Failed to run Prime scan (HTTP ${res.status}).`);
       setScanData(data.data);
       setLastUpdate(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
-    } catch (err) { setError(err instanceof Error ? err.message : 'Failed to run Prime scan'); }
+    } catch (err) { setError(stringifyError(err) || 'Failed to run Prime scan'); }
     finally { setIsLoading(false); }
   };
 
@@ -97,7 +111,7 @@ export function DashboardClient() {
     <DashboardHeader isConnected={isConnected} isLoading={isLoading} onConnect={handleConnect} onRefresh={checkConnection} onScan={handleScan} lastUpdate={lastUpdate} />
     <MarketStatusBar marketStatus={currentMarketStatus || scanData?.marketStatus || defaultMarketStatus} />
     <main className="mx-auto max-w-[1800px] px-4 py-6">
-      {error && <div className="mb-6 flex items-center gap-3 rounded-lg border border-red-600/30 bg-red-500/10 p-4 text-red-400"><AlertCircle className="h-5 w-5" /><span>{error}</span></div>}
+      {error && <div className="mb-6 flex items-center gap-3 rounded-lg border border-red-600/30 bg-red-500/10 p-4 text-red-400"><AlertCircle className="h-5 w-5" /><span className="break-words">{error}</span></div>}
       {isLoading && !scanData && <div className="flex min-h-[600px] items-center justify-center"><div className="text-center"><Loader2 className="mx-auto h-12 w-12 animate-spin text-blue-500" /><p className="mt-4 text-slate-400">Loading Prime Scanner...</p></div></div>}
       {!isLoading && !isConnected && !scanData && <div className="flex min-h-[600px] items-center justify-center"><div className="max-w-md text-center"><div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-slate-800"><AlertCircle className="h-8 w-8 text-slate-400" /></div><h2 className="mt-6 text-2xl font-bold text-white">UPSTOX NOT CONFIGURED</h2><p className="mt-2 text-slate-400">Set the Analytics Token as a server-side environment variable, then click verify.</p><button onClick={handleConnect} className="mt-6 rounded-lg bg-blue-600 px-6 py-3 font-medium text-white hover:bg-blue-700">VERIFY UPSTOX</button></div></div>}
       {scanData && <div className="space-y-6"><SummaryCards summary={scanData.summary} /><div><div className="mb-4 flex items-center justify-between"><h2 className="text-lg font-semibold text-white">Prime Scanner Results</h2><div className="text-sm text-slate-400">{scanData.summary.scannedCount} / {scanData.summary.universeCount} F&O stocks scanned{scanData.summary.failedCount ? ` • ${scanData.summary.failedCount} unavailable` : ''}{scanData.asOfDate ? ` • Signal date ${new Date(`${scanData.asOfDate}T00:00:00+05:30`).toLocaleDateString('en-IN')}` : ''}</div></div><ScannerTable results={scanData.results} onSelectStock={setSelectedStock} selectedStock={selectedStock} /></div><div className="rounded-lg border border-amber-600/30 bg-amber-500/10 p-4 text-sm text-amber-400"><p className="font-semibold">PRIME SIGNAL ENGINE:</p><p className="mt-2">Signals use the supplied PRIME TECHNICAL v3 FAST PRIME logic on the NSE cash 5-minute chart, with F&O stocks defining the scan universe. YH/PDH or YL/PDL close-break + volume ≥1.5x + EMA20 alignment are required for confirmation.</p></div></div>}
