@@ -15,6 +15,21 @@ const NSE_INDEX_FUTURES = new Set(['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY
 
 export interface UpstoxFuturesInstrument { segment: string; name: string; exchange: string; instrument_type: string; instrument_key: string; trading_symbol: string; underlying_symbol: string; underlying_type?: string; lot_size: number; expiry: string | number; weekly?: boolean; }
 export interface UpstoxEquityInstrument { segment: string; name: string; exchange: string; instrument_type: string; instrument_key: string; trading_symbol: string; lot_size?: number; isin?: string; }
+type NSEInstrumentRow = UpstoxFuturesInstrument | UpstoxEquityInstrument;
+
+let nseInstrumentRowsPromise: Promise<NSEInstrumentRow[]> | null = null;
+
+async function getNSEInstrumentRows(): Promise<NSEInstrumentRow[]> {
+  if (!nseInstrumentRowsPromise) {
+    nseInstrumentRowsPromise = axios.get<ArrayBuffer>(NSE_INSTRUMENTS_URL, { responseType: 'arraybuffer', timeout: 10000 })
+      .then(response => JSON.parse(gunzipSync(Buffer.from(response.data)).toString('utf8')) as NSEInstrumentRow[])
+      .catch(error => {
+        nseInstrumentRowsPromise = null;
+        throw error;
+      });
+  }
+  return nseInstrumentRowsPromise;
+}
 
 export class UpstoxService {
   private readonly analyticsToken: string;
@@ -27,9 +42,9 @@ export class UpstoxService {
     const minuteInterval = interval === '1minute' ? '1' : interval === '5minute' ? '5' : interval === '30minute' ? '30' : null;
     const path = minuteInterval
       ? (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${minuteInterval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${minuteInterval}/${toDate}`)
-      : (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}`);
+      : (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}`);
     try {
-      const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, { headers: this.authHeaders(), timeout: 7000 });
+      const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, { headers: this.authHeaders(), timeout: 5000 });
       if (response.data.status !== 'success') return [];
       return (response.data.data?.candles || []).map(candle => ({ timestamp: candle[0], open: candle[1], high: candle[2], low: candle[3], close: candle[4], volume: candle[5] }));
     } catch (error) {
@@ -40,20 +55,20 @@ export class UpstoxService {
   }
 
   async getAllNSEFuturesInstruments(): Promise<Record<string, UpstoxFuturesInstrument>> {
-    const response = await axios.get<ArrayBuffer>(NSE_INSTRUMENTS_URL, { responseType: 'arraybuffer', timeout: 20000 });
-    const rows = JSON.parse(gunzipSync(Buffer.from(response.data)).toString('utf8')) as UpstoxFuturesInstrument[];
+    const rows = await getNSEInstrumentRows();
     const now = Date.now(); const result: Record<string, UpstoxFuturesInstrument> = {};
     for (const row of rows) {
       if (row.segment !== 'NSE_FO' || row.instrument_type !== 'FUT') continue;
-      if (row.underlying_type && row.underlying_type !== 'EQUITY') continue;
-      if (!row.underlying_symbol) continue;
-      const key = row.underlying_symbol.toUpperCase();
+      const future = row as UpstoxFuturesInstrument;
+      if (future.underlying_type && future.underlying_type !== 'EQUITY') continue;
+      if (!future.underlying_symbol) continue;
+      const key = future.underlying_symbol.toUpperCase();
       if (NSE_INDEX_FUTURES.has(key)) continue;
-      const expiryMs = typeof row.expiry === 'number' ? row.expiry : Date.parse(row.expiry);
+      const expiryMs = typeof future.expiry === 'number' ? future.expiry : Date.parse(future.expiry);
       if (!Number.isFinite(expiryMs) || expiryMs < now) continue;
       const current = result[key];
-      if (!current) result[key] = row;
-      else { const currentExpiry = typeof current.expiry === 'number' ? current.expiry : Date.parse(current.expiry); if (expiryMs < currentExpiry) result[key] = row; }
+      if (!current) result[key] = future;
+      else { const currentExpiry = typeof current.expiry === 'number' ? current.expiry : Date.parse(current.expiry); if (expiryMs < currentExpiry) result[key] = future; }
     }
     return result;
   }
@@ -62,9 +77,8 @@ export class UpstoxService {
     const all = await this.getAllNSEFuturesInstruments(); const wanted = new Set(symbols.map(s => s.toUpperCase())); return Object.fromEntries(Object.entries(all).filter(([symbol]) => wanted.has(symbol)));
   }
   async getNSEEquityInstruments(symbols: string[]): Promise<Record<string, UpstoxEquityInstrument>> {
-    const response = await axios.get<ArrayBuffer>(NSE_INSTRUMENTS_URL, { responseType: 'arraybuffer', timeout: 20000 });
-    const rows = JSON.parse(gunzipSync(Buffer.from(response.data)).toString('utf8')) as UpstoxEquityInstrument[]; const wanted = new Set(symbols.map(s => s.toUpperCase())); const result: Record<string, UpstoxEquityInstrument> = {};
-    for (const row of rows) if (row.segment === 'NSE_EQ' && row.instrument_type === 'EQ' && wanted.has((row.trading_symbol || '').toUpperCase())) result[row.trading_symbol.toUpperCase()] = row;
+    const rows = await getNSEInstrumentRows(); const wanted = new Set(symbols.map(s => s.toUpperCase())); const result: Record<string, UpstoxEquityInstrument> = {};
+    for (const row of rows) if (row.segment === 'NSE_EQ' && row.instrument_type === 'EQ' && wanted.has((row.trading_symbol || '').toUpperCase())) result[row.trading_symbol.toUpperCase()] = row as UpstoxEquityInstrument;
     return result;
   }
   async getMarketQuotes(instrumentKeys: string[]): Promise<UpstoxQuoteResponse['data']> {
