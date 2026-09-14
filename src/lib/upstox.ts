@@ -23,10 +23,7 @@ async function getNSEInstrumentRows(): Promise<NSEInstrumentRow[]> {
   if (!nseInstrumentRowsPromise) {
     nseInstrumentRowsPromise = axios.get<ArrayBuffer>(NSE_INSTRUMENTS_URL, { responseType: 'arraybuffer', timeout: 10000 })
       .then(response => JSON.parse(gunzipSync(Buffer.from(response.data)).toString('utf8')) as NSEInstrumentRow[])
-      .catch(error => {
-        nseInstrumentRowsPromise = null;
-        throw error;
-      });
+      .catch(error => { nseInstrumentRowsPromise = null; throw error; });
   }
   return nseInstrumentRowsPromise;
 }
@@ -42,9 +39,9 @@ export class UpstoxService {
     const minuteInterval = interval === '1minute' ? '1' : interval === '5minute' ? '5' : interval === '30minute' ? '30' : null;
     const path = minuteInterval
       ? (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${minuteInterval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${minuteInterval}/${toDate}`)
-      : (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}`);
+      : (fromDate ? `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}/${fromDate}` : `/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${toDate}`);
     try {
-      const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, { headers: this.authHeaders(), timeout: 5000 });
+      const response = await axios.get<UpstoxHistoricalCandleResponse>(`${UPSTOX_API_V3_BASE}${path}`, { headers: this.authHeaders(), timeout: 8000 });
       if (response.data.status !== 'success') return [];
       return (response.data.data?.candles || []).map(candle => ({ timestamp: candle[0], open: candle[1], high: candle[2], low: candle[3], close: candle[4], volume: candle[5] }));
     } catch (error) {
@@ -72,7 +69,6 @@ export class UpstoxService {
     }
     return result;
   }
-
   async getNSEFuturesInstruments(symbols: string[]): Promise<Record<string, UpstoxFuturesInstrument>> {
     const all = await this.getAllNSEFuturesInstruments(); const wanted = new Set(symbols.map(s => s.toUpperCase())); return Object.fromEntries(Object.entries(all).filter(([symbol]) => wanted.has(symbol)));
   }
