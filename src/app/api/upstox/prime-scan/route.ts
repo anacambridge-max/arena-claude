@@ -33,11 +33,7 @@ function signalPriority(state: ReturnType<typeof runPrimeScan>['state']) {
 
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-/**
- * Keep Upstox below its 50 req/sec standard API limit. During market hours
- * each stock can use historical + intraday, so start one every 42ms. Outside
- * market hours we only need historical, so one every 22ms is safe and faster.
- */
+/** Keep Upstox below 50 req/sec. Closed market = 1 call/stock; open = 2 calls/stock. */
 async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>, intervalMs: number) {
   let nextIndex = 0;
   let nextStartAt = Date.now();
@@ -105,7 +101,8 @@ async function executeScan(): Promise<ScanPayload> {
   const quoteByToken = new Map<string, (typeof quotes)[string]>();
   for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-  const fromDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  // Five calendar days covers the normal weekend gap plus enough warm-up for EMA20/SMA20.
+  const fromDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const useIntraday = isNseMarketWindowNow();
   const results: ReturnType<typeof runPrimeScan>[] = [];
   let failedCount = 0;
@@ -130,7 +127,6 @@ async function executeScan(): Promise<ScanPayload> {
           .slice()
           .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
           .filter(c => istDate(c.timestamp) === today && isPrimeWindow(c.timestamp));
-
         if (intradayToday.length > 0) {
           latestDate = today;
           sessionCandles = intradayToday;
@@ -139,9 +135,7 @@ async function executeScan(): Promise<ScanPayload> {
         }
       }
 
-      // Market closed (or an unavailable intraday feed): use the latest
-      // completed NSE session returned by Historical V3. This is what keeps
-      // the dashboard populated after 15:30 instead of showing 0/210.
+      // Closed market or missing intraday: scan latest completed session from history.
       if (!latestDate) {
         latestDate = historicalDates.at(-1) || '';
         sessionCandles = historicalSorted.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
@@ -185,8 +179,6 @@ async function executeScan(): Promise<ScanPayload> {
     }
   };
 
-  // Closed-market scan: one API call per stock, so we can safely run close to
-  // the 50 req/sec Upstox limit. Open-market scan: two calls per stock.
   await runRateLimited(instruments, scanOne, useIntraday ? 42 : 22);
 
   const rankedResults = rankScanResults(results);
