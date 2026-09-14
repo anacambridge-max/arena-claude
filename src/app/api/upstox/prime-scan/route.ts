@@ -69,9 +69,7 @@ export async function GET() {
         const sessionCandles = candles.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
         if (!previousDayCandles.length || !sessionCandles.length) return { ok: false as const };
 
-        // Do not overwrite a strong early Pine signal with a weaker later state.
-        // This is important for cases such as a 09:15 PRIME BUY followed by a
-        // 09:40/09:45 SETUP. The dashboard should still show the confirmed BUY.
+        // Keep the strongest Pine state; within the same state keep the latest candle.
         let bestSignal: ReturnType<typeof runPrimeScan> | null = null;
         for (const candle of sessionCandles) {
           const before = candles.filter(c => new Date(c.timestamp).getTime() < new Date(candle.timestamp).getTime());
@@ -88,8 +86,8 @@ export async function GET() {
             previousDayCandles,
           };
           const result = runPrimeScan(input);
-          if (result.state === 'NO_TRADE') continue;
-          if (!bestSignal || signalPriority(result.state) > signalPriority(bestSignal.state) || (signalPriority(result.state) === signalPriority(bestSignal.state) && new Date(result.candle.timestamp).getTime() > new Date(bestSignal.candle.timestamp).getTime())) {
+          if (result.state === 'NO_TRADE' || !result.candle) continue;
+          if (!bestSignal || signalPriority(result.state) > signalPriority(bestSignal.state) || (signalPriority(result.state) === signalPriority(bestSignal.state) && new Date(result.candle.timestamp).getTime() > new Date(bestSignal.candle!.timestamp).getTime())) {
             bestSignal = result;
           }
         }
