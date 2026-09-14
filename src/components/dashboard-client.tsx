@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { PrimeScanResult, MarketStatus } from '@/domain/prime';
 import { DashboardHeader } from './dashboard/header';
 import { MarketStatusBar } from './dashboard/market-status-bar';
@@ -64,11 +64,15 @@ export function DashboardClient() {
   const [selectedStock, setSelectedStock] = useState<PrimeScanResult | null>(null);
   const [lastUpdate, setLastUpdate] = useState<string | null>(null);
   const [currentMarketStatus, setCurrentMarketStatus] = useState<MarketStatus>(liveMarketStatus());
+  const scanAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     checkConnection();
     const timer = window.setInterval(() => setCurrentMarketStatus(liveMarketStatus()), 1000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      scanAbortRef.current?.abort();
+    };
   }, []);
 
   const checkConnection = async () => {
@@ -94,15 +98,30 @@ export function DashboardClient() {
   };
 
   const handleScan = async () => {
+    // A second click explicitly restarts the scan instead of waiting forever
+    // behind a previous stuck/slow request.
+    scanAbortRef.current?.abort();
+    const controller = new AbortController();
+    scanAbortRef.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 35000);
     setIsLoading(true); setError(null);
     try {
-      const res = await fetch('/api/upstox/prime-scan', { cache: 'no-store', headers: { Accept: 'application/json' } });
+      const res = await fetch('/api/upstox/prime-scan', { cache: 'no-store', headers: { Accept: 'application/json' }, signal: controller.signal });
       const data = await readApiResponse<ScannerResponse>(res);
       if (!res.ok || data.status !== 'success' || !data.data) throw new Error(stringifyError(data.message) || stringifyError(data.error) || `Failed to run Prime scan (HTTP ${res.status}).`);
       setScanData(data.data);
       setLastUpdate(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
-    } catch (err) { setError(stringifyError(err) || 'Failed to run Prime scan'); }
-    finally { setIsLoading(false); }
+    } catch (err) {
+      if ((err instanceof DOMException && err.name === 'AbortError') || (err instanceof Error && err.name === 'AbortError')) {
+        if (scanAbortRef.current === controller) setError('Scan was restarted or timed out.');
+      } else setError(stringifyError(err) || 'Failed to run Prime scan');
+    } finally {
+      window.clearTimeout(timeout);
+      if (scanAbortRef.current === controller) {
+        scanAbortRef.current = null;
+        setIsLoading(false);
+      }
+    }
   };
 
   const defaultMarketStatus: MarketStatus = { isOpen: false, session: 'CLOSED', currentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }), nextChange: null };
