@@ -51,12 +51,15 @@ export async function GET() {
     const quoteByToken = new Map<string, (typeof quotes)[string]>();
     for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
+    // Five trading days is enough warm-up for EMA20, volume SMA20 and range SMA10,
+    // while keeping the server response fast. It also avoids downloading a month
+    // of candles for every one of the ~210 F&O stocks.
+    const fromDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
     const scanOne = async (instrument: (typeof instruments)[number]) => {
       const quote = quoteByToken.get(instrument.instrumentKey) ?? quotes[instrument.instrumentKey];
       if (!quote?.last_price) return { ok: false as const };
       try {
-        // One month gives EMA20 enough warm-up history to closely match TradingView.
-        const fromDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
         const raw = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', getTodayDateIST(), fromDate);
         const candles = raw.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
         if (candles.length < 30) return { ok: false as const };
@@ -69,7 +72,6 @@ export async function GET() {
         const sessionCandles = candles.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
         if (!previousDayCandles.length || !sessionCandles.length) return { ok: false as const };
 
-        // Keep the strongest Pine state; within the same state keep the latest candle.
         let bestSignal: ReturnType<typeof runPrimeScan> | null = null;
         for (const candle of sessionCandles) {
           const before = candles.filter(c => new Date(c.timestamp).getTime() < new Date(candle.timestamp).getTime());
@@ -87,9 +89,7 @@ export async function GET() {
           };
           const result = runPrimeScan(input);
           if (result.state === 'NO_TRADE' || !result.candle) continue;
-          if (!bestSignal || signalPriority(result.state) > signalPriority(bestSignal.state) || (signalPriority(result.state) === signalPriority(bestSignal.state) && new Date(result.candle.timestamp).getTime() > new Date(bestSignal.candle!.timestamp).getTime())) {
-            bestSignal = result;
-          }
+          if (!bestSignal || signalPriority(result.state) > signalPriority(bestSignal.state) || (signalPriority(result.state) === signalPriority(bestSignal.state) && new Date(result.candle.timestamp).getTime() > new Date(bestSignal.candle!.timestamp).getTime())) bestSignal = result;
         }
         return { ok: true as const, result: bestSignal };
       } catch (error) {
