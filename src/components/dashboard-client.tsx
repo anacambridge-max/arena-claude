@@ -103,7 +103,10 @@ export function DashboardClient() {
     scanAbortRef.current?.abort();
     const controller = new AbortController();
     scanAbortRef.current = controller;
-    const timeout = window.setTimeout(() => controller.abort(), 35000);
+    // Full F&O scans can legitimately take longer on a cold Vercel function.
+    // The server route allows up to 300s; keep the browser alive long enough
+    // to receive the completed 210-stock response instead of aborting at 35s.
+    const timeout = window.setTimeout(() => controller.abort(), 90000);
     setIsLoading(true); setError(null);
     try {
       const res = await fetch('/api/upstox/prime-scan', { cache: 'no-store', headers: { Accept: 'application/json' }, signal: controller.signal });
