@@ -29,34 +29,46 @@ function signalPriority(state: ReturnType<typeof runPrimeScan>['state']) {
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 /**
- * Keep concurrency high enough for a fast full-universe scan without opening
- * hundreds of simultaneous sockets. Closed market = one historical request per
- * stock; open market = historical + intraday, so the start interval changes.
+ * Global Upstox request scheduler. Standard APIs are limited to 50 req/sec.
+ * Many stock workers can remain active, while actual HTTP requests are started
+ * at 20ms intervals. This lets historical and intraday calls overlap instead
+ * of making every stock wait for its historical request first.
  */
-async function runRateLimited<T>(items: T[], worker: (item: T) => Promise<void>, intervalMs: number, concurrency = 50) {
-  let nextIndex = 0;
-  let nextStartAt = Date.now();
-  const startLock: { promise: Promise<void> } = { promise: Promise.resolve() };
-  const acquireStartSlot = async () => {
+class UpstoxRequestLimiter {
+  private nextStartAt = Date.now();
+  private lock: Promise<void> = Promise.resolve();
+
+  async run<T>(request: () => Promise<T>): Promise<T> {
     let release!: () => void;
-    const previous = startLock.promise;
-    startLock.promise = new Promise<void>(resolve => { release = resolve; });
+    const previous = this.lock;
+    this.lock = new Promise<void>(resolve => { release = resolve; });
     await previous;
     const now = Date.now();
-    const startAt = Math.max(now, nextStartAt);
-    nextStartAt = startAt + intervalMs;
+    const startAt = Math.max(now, this.nextStartAt);
+    this.nextStartAt = startAt + 20;
     release();
     if (startAt > now) await sleep(startAt - now);
-  };
-  const runner = async () => {
-    while (true) {
-      const index = nextIndex++;
-      if (index >= items.length) return;
-      await acquireStartSlot();
-      await worker(items[index]);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => runner()));
+    return request();
+  }
+}
+
+type CandleCacheEntry = {
+  candles: Awaited<ReturnType<typeof upstoxService.getHistoricalCandles>>;
+  createdAt: number;
+};
+
+// Historical candles are immutable for the requested completed-session range.
+// Keeping them on the warm Vercel instance makes subsequent scans dramatically
+// faster, especially during the 09:15-10:00 scan window.
+const historicalCache = new Map<string, CandleCacheEntry>();
+
+async function getCachedHistorical(instrumentKey: string, toDate: string, fromDate: string, limiter: UpstoxRequestLimiter) {
+  const key = `${instrumentKey}|${toDate}|${fromDate}`;
+  const cached = historicalCache.get(key);
+  if (cached) return cached.candles;
+  const candles = await limiter.run(() => upstoxService.getHistoricalCandles(instrumentKey, '5minute', toDate, fromDate));
+  historicalCache.set(key, { candles, createdAt: Date.now() });
+  return candles;
 }
 
 type ScanPayload = {
@@ -95,18 +107,28 @@ async function executeScan(): Promise<ScanPayload> {
   const quoteByToken = new Map<string, (typeof quotes)[string]>();
   for (const quote of Object.values(quotes)) if (quote.instrument_token) quoteByToken.set(quote.instrument_token, quote);
 
-  // Only fetch the minimum history needed by PRIME: previous session + warm-up.
-  // Four calendar days covers a normal weekend gap and exchange holiday gap.
+  // PRIME only needs the previous completed session plus 20+ warm-up candles.
+  // Four calendar days covers a normal weekend and short holiday gap.
   const fromDate = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const useIntraday = isNseMarketWindowNow();
+  const limiter = new UpstoxRequestLimiter();
   const results: ReturnType<typeof runPrimeScan>[] = [];
   let failedCount = 0;
 
-  const scanOne = async (instrument: (typeof instruments)[number]) => {
+  // Keep all 210 stocks active. The request limiter controls Upstox traffic;
+  // workers themselves no longer serialize historical -> intraday per stock.
+  await Promise.all(instruments.map(async instrument => {
     const quote = quoteByToken.get(instrument.instrumentKey) ?? quotes[instrument.instrumentKey];
     if (!quote?.last_price) { failedCount += 1; return; }
     try {
-      const historical = await upstoxService.getHistoricalCandles(instrument.instrumentKey, '5minute', today, fromDate);
+      // These are independently rate-limited, so open-market scans overlap the
+      // two network calls instead of waiting for historical data first.
+      const historicalPromise = getCachedHistorical(instrument.instrumentKey, today, fromDate, limiter);
+      const intradayPromise = useIntraday
+        ? limiter.run(() => upstoxService.getIntradayCandles(instrument.instrumentKey, '5'))
+        : Promise.resolve(null);
+      const [historical, intraday] = await Promise.all([historicalPromise, intradayPromise]);
+
       const historicalSorted = historical.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
       const historicalDates = [...new Set(historicalSorted.map(c => istDate(c.timestamp)))].sort();
       let latestDate = '';
@@ -114,8 +136,7 @@ async function executeScan(): Promise<ScanPayload> {
       let previousDate: string | undefined;
       let previousDayCandles: typeof historicalSorted = [];
 
-      if (useIntraday) {
-        const intraday = await upstoxService.getIntradayCandles(instrument.instrumentKey, '5');
+      if (intraday) {
         const intradayToday = intraday.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()).filter(c => istDate(c.timestamp) === today && isPrimeWindow(c.timestamp));
         if (intradayToday.length > 0) {
           latestDate = today;
@@ -124,17 +145,22 @@ async function executeScan(): Promise<ScanPayload> {
           previousDayCandles = previousDate ? historicalSorted.filter(c => istDate(c.timestamp) === previousDate) : [];
         }
       }
+
+      // Closed market OR empty current-day intraday: use the latest completed
+      // session from Historical Candle V3.
       if (!latestDate) {
         latestDate = historicalDates.at(-1) || '';
         sessionCandles = historicalSorted.filter(c => istDate(c.timestamp) === latestDate && isPrimeWindow(c.timestamp));
         previousDate = historicalDates.filter(date => date < latestDate).at(-1);
         previousDayCandles = previousDate ? historicalSorted.filter(c => istDate(c.timestamp) === previousDate) : [];
       }
+
       if (!latestDate || !sessionCandles.length || !previousDayCandles.length) { failedCount += 1; return; }
       const warmup = historicalSorted.filter(c => istDate(c.timestamp) < latestDate);
       if (warmup.length < 20) { failedCount += 1; return; }
       const workingCandles = [...warmup, ...sessionCandles].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
       let bestSignal: ReturnType<typeof runPrimeScan> | null = null;
+
       for (const candle of sessionCandles) {
         const candleTime = new Date(candle.timestamp).getTime();
         const before = workingCandles.filter(c => new Date(c.timestamp).getTime() < candleTime);
@@ -159,10 +185,7 @@ async function executeScan(): Promise<ScanPayload> {
       failedCount += 1;
       console.error(`Scan failed for ${instrument.symbol}:`, error);
     }
-  };
-
-  // Closed: 50 requests/sec. Open: 2 calls/stock, so 25 requests/sec.
-  await runRateLimited(instruments, scanOne, useIntraday ? 40 : 20, 50);
+  }));
 
   const rankedResults = rankScanResults(results);
   const buyCount = rankedResults.filter(r => r.state === 'CONFIRMED' && r.direction === 'BULLISH').length;
